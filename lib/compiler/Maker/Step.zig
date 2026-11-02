@@ -197,7 +197,11 @@ pub const Inputs = struct {
 
     pub const Table = std.array_hash_map.Custom(Path, Files, Path.TableAdapter, false);
     /// The special file name "." means any changes inside the directory.
-    pub const Files = std.ArrayList([]const u8);
+    pub const File = struct {
+        basename: []const u8,
+        existence_only: bool = false,
+    };
+    pub const Files = std.ArrayList(File);
 
     pub fn populated(inputs: *Inputs) bool {
         return inputs.table.count() != 0;
@@ -672,7 +676,8 @@ fn zigProcessUpdate(step_index: Configuration.Step.Index, maker: *Maker, zp: *Zi
                 const conf_step = step_index.ptr(conf);
                 var it = std.mem.splitScalar(u8, body, 0);
                 while (it.next()) |prefixed_path| {
-                    const prefix_index: std.zig.Server.Message.PathPrefix = @fromBackingInt(@intCast(prefixed_path[0] - 1));
+                    const input: std.zig.Server.Message.FileSystemInput = @bitCast(prefixed_path[0]);
+                    const prefix_index: std.zig.Server.Message.PathPrefix = @fromBackingInt(input.prefix - 1);
                     const sub_path = try arena.dupe(u8, prefixed_path[1..]);
                     const sub_path_dirname = Dir.path.dirname(sub_path) orelse "";
                     switch (prefix_index) {
@@ -681,14 +686,14 @@ fn zigProcessUpdate(step_index: Configuration.Step.Index, maker: *Maker, zp: *Zi
                                 .root_dir = .cwd(),
                                 .sub_path = sub_path_dirname,
                             };
-                            try addWatchInputFromPath(s, maker, path, Dir.path.basename(sub_path));
+                            try addWatchInputFromPath(s, maker, path, .{ .basename = Dir.path.basename(sub_path), .existence_only = input.existence_only });
                         },
                         .zig_lib => zl: {
                             switch (conf_step.extended.get(conf.extra)) {
                                 .compile => |compile| if (compile.zig_lib_dir.value) |zig_lib_dir| {
                                     const resolved = try maker.resolveLazyPathIndex(arena, zig_lib_dir, step_index);
                                     const appended = try resolved.join(arena, sub_path);
-                                    try addWatchInputPath(s, maker, appended);
+                                    try addWatchInputPath(s, maker, appended, input.existence_only);
                                     break :zl;
                                 },
                                 else => {},
@@ -697,28 +702,28 @@ fn zigProcessUpdate(step_index: Configuration.Step.Index, maker: *Maker, zp: *Zi
                                 .root_dir = graph.zig_lib_directory,
                                 .sub_path = sub_path_dirname,
                             };
-                            try addWatchInputFromPath(s, maker, path, Dir.path.basename(sub_path));
+                            try addWatchInputFromPath(s, maker, path, .{ .basename = Dir.path.basename(sub_path), .existence_only = input.existence_only });
                         },
                         .local_cache => {
                             const path: Path = .{
                                 .root_dir = graph.local_cache_root,
                                 .sub_path = sub_path_dirname,
                             };
-                            try addWatchInputFromPath(s, maker, path, Dir.path.basename(sub_path));
+                            try addWatchInputFromPath(s, maker, path, .{ .basename = Dir.path.basename(sub_path), .existence_only = input.existence_only });
                         },
                         .global_cache => {
                             const path: Path = .{
                                 .root_dir = graph.global_cache_root,
                                 .sub_path = sub_path_dirname,
                             };
-                            try addWatchInputFromPath(s, maker, path, Dir.path.basename(sub_path));
+                            try addWatchInputFromPath(s, maker, path, .{ .basename = Dir.path.basename(sub_path), .existence_only = input.existence_only });
                         },
                         .build_root => {
                             const path: Path = .{
                                 .root_dir = graph.build_root_directory,
                                 .sub_path = sub_path_dirname,
                             };
-                            try addWatchInputFromPath(s, maker, path, Dir.path.basename(sub_path));
+                            try addWatchInputFromPath(s, maker, path, .{ .basename = Dir.path.basename(sub_path), .existence_only = input.existence_only });
                         },
                     }
                 }
@@ -901,10 +906,10 @@ pub fn setWatchInputsFromManifestFiles(
             .root_dir = prefixes[file.flags.prefix],
             .sub_path = sub_path,
         };
-        if (file.flags.is_directory) {
+        if (file.flags.is_directory and !file.flags.existence_only) {
             try addDirectoryWatchInputFromPath(s, maker, path);
         } else {
-            try addWatchInputPath(s, maker, path);
+            try addWatchInputPath(s, maker, path, file.flags.existence_only);
         }
     }
 }
@@ -925,11 +930,11 @@ pub fn addWatchInput(step: *Step, maker: *Maker, arena: Allocator, lazy_file: La
         .source_path => |source_path| {
             const sub_path = source_path.sub_path.slice(conf);
             const pkg_path = try maker.packagePath(arena, source_path.owner, sub_path);
-            try addWatchInputPath(step, maker, pkg_path);
+            try addWatchInputPath(step, maker, pkg_path, false);
         },
         .relative => |relative| {
             const resolved_path = try maker.relativePath(arena, relative, step);
-            try addWatchInputPath(step, maker, resolved_path);
+            try addWatchInputPath(step, maker, resolved_path, false);
         },
         // Nothing to watch because this dependency edge is modeled instead via `dependants`.
         .generated => {},
@@ -972,21 +977,21 @@ pub fn addDirectoryWatchInput(step: *Step, maker: *Maker, lazy_directory: LazyPa
 /// In other words, before calling this function, first check that the
 /// `LazyPath` which this `path` is derived from is not `generated`.
 pub fn addDirectoryWatchInputFromPath(step: *Step, maker: *Maker, path: Path) !void {
-    return addWatchInputFromPath(step, maker, path, ".");
+    return addWatchInputFromPath(step, maker, path, .{ .basename = "." });
 }
 
-fn addWatchInputPath(step: *Step, maker: *Maker, path: Path) Allocator.Error!void {
+fn addWatchInputPath(step: *Step, maker: *Maker, path: Path, existence_only: bool) Allocator.Error!void {
     return addWatchInputFromPath(step, maker, .{
         .root_dir = path.root_dir,
         .sub_path = Dir.path.dirname(path.sub_path) orelse "",
-    }, Dir.path.basename(path.sub_path));
+    }, .{ .basename = Dir.path.basename(path.sub_path), .existence_only = existence_only });
 }
 
-fn addWatchInputFromPath(step: *Step, maker: *Maker, directory: Path, basename: []const u8) Allocator.Error!void {
+fn addWatchInputFromPath(step: *Step, maker: *Maker, directory: Path, input: Inputs.File) Allocator.Error!void {
     const gpa = maker.gpa;
     const gop = try step.inputs.table.getOrPut(gpa, directory);
     if (!gop.found_existing) gop.value_ptr.* = .empty;
-    try gop.value_ptr.append(gpa, basename);
+    try gop.value_ptr.append(gpa, input);
 }
 
 fn oomWrap(s: *Step, result: error{OutOfMemory}!void) void {

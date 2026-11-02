@@ -31,7 +31,7 @@ paths_arena: std.heap.ArenaAllocator.State,
 watch_roots: [][:0]const u8,
 /// All of the paths being watched. Value is the set of steps which depend on the file/directory.
 /// Keys and values are in `paths_arena`, but this map is allocated into the GPA.
-watch_paths: std.array_hash_map.String([]const std.Build.Configuration.Step.Index),
+watch_paths: std.array_hash_map.String(StepSet),
 
 /// The semaphore we use to block the thread calling `wait` until the callback determines a relevant
 /// event has occurred. This is retained across `wait` calls for simplicity and efficiency.
@@ -47,6 +47,9 @@ since_event: FSEventStreamEventId,
 cwd_path: []const u8,
 
 must_reconfigure: bool,
+
+/// True means only changes to the node matter; false also watches contents.
+const StepSet = std.array_hash_map.Auto(std.Build.Configuration.Step.Index, bool);
 
 /// All of the symbols we pull from the `dlopen`ed CoreServices framework. If any of these symbols
 /// is not present, `init` will close the framework and return an error.
@@ -135,32 +138,17 @@ pub fn setPaths(fse: *FsEvents, maker: *Maker, steps: []const std.Build.Configur
     defer need_dirs.deinit(gpa);
 
     fse.watch_paths.clearRetainingCapacity();
+    // The previous event stream has stopped. Rebuild every arena-owned path
+    // and reaction before wait uses them again.
+    _ = paths_arena_instance.reset(.retain_capacity);
 
-    // We take `step_index` by pointer for a slight memory optimization in a moment.
-    for (steps) |*step_index| {
-        const step = maker.stepByIndex(step_index.*);
+    for (steps) |step_index| {
+        const step = maker.stepByIndex(step_index);
         for (step.inputs.table.keys(), step.inputs.table.values()) |path, *files| {
-            const resolved_dir = try std.fs.path.resolvePosix(paths_arena, &.{
-                fse.cwd_path, path.root_dir.path orelse ".", path.sub_path,
-            });
-            try need_dirs.put(gpa, resolved_dir, {});
-            for (files.items) |file_name| {
-                const watch_path = if (std.mem.eql(u8, file_name, "."))
-                    resolved_dir
-                else
-                    try std.fs.path.join(paths_arena, &.{ resolved_dir, file_name });
-                const gop = try fse.watch_paths.getOrPut(gpa, watch_path);
-                if (gop.found_existing) {
-                    const old_steps = gop.value_ptr.*;
-                    const new_steps = try paths_arena.alloc(std.Build.Configuration.Step.Index, old_steps.len + 1);
-                    @memcpy(new_steps[0..old_steps.len], old_steps);
-                    new_steps[old_steps.len] = step_index.*;
-                    gop.value_ptr.* = new_steps;
-                } else {
-                    // This is why we captured `step` by pointer! We can avoid allocating a slice of one
-                    // step in the arena in the common case where a file is referenced by only one step.
-                    gop.value_ptr.* = step_index[0..1];
-                }
+            for (files.items) |input| {
+                const logical_dir = try path.toString(paths_arena);
+                const logical_path = try std.fs.path.join(paths_arena, &.{ logical_dir, input.basename });
+                try fse.addInputPath(maker, paths_arena, &need_dirs, logical_path, step_index, input.existence_only, 0);
             }
         }
     }
@@ -330,6 +318,85 @@ const cf_alloc_callbacks = struct {
     }
 };
 
+fn addWatchPath(
+    fse: *FsEvents,
+    gpa: Allocator,
+    arena: Allocator,
+    path: []const u8,
+    step_index: std.Build.Configuration.Step.Index,
+    existence_only: bool,
+) !void {
+    const gop = try fse.watch_paths.getOrPut(gpa, path);
+    if (!gop.found_existing) gop.value_ptr.* = .empty;
+    try addReaction(arena, gop.value_ptr, step_index, existence_only);
+}
+
+fn addReaction(arena: Allocator, steps: *StepSet, index: std.Build.Configuration.Step.Index, existence_only: bool) !void {
+    const entry = try steps.getOrPut(arena, index);
+    if (entry.found_existing) {
+        // Several candidates can share an ancestor or symlink. Retain one
+        // reaction per step, with content dependencies taking precedence.
+        entry.value_ptr.* = entry.value_ptr.* and existence_only;
+    } else entry.value_ptr.* = existence_only;
+}
+
+test "watch reactions deduplicate candidates and retain stronger dependencies" {
+    var steps: StepSet = .empty;
+    defer steps.deinit(std.testing.allocator);
+    const index: std.Build.Configuration.Step.Index = @fromBackingInt(@intCast(0));
+    for (0..1000) |_| try addReaction(std.testing.allocator, &steps, index, true);
+    try std.testing.expectEqual(1, steps.count());
+    try std.testing.expect(steps.get(index).?);
+    try addReaction(std.testing.allocator, &steps, index, false);
+    try addReaction(std.testing.allocator, &steps, index, true);
+    try std.testing.expectEqual(1, steps.count());
+    try std.testing.expect(!steps.get(index).?);
+}
+
+fn addInputPath(
+    fse: *FsEvents,
+    maker: *Maker,
+    arena: Allocator,
+    directories: *std.array_hash_map.String(void),
+    logical_path: []const u8,
+    step_index: std.Build.Configuration.Step.Index,
+    existence_only: bool,
+    symlinks: u8,
+) !void {
+    const io = maker.graph.io;
+    const gpa = maker.gpa;
+    const path = if (std.fs.path.isAbsolute(logical_path)) logical_path else try std.fs.path.join(arena, &.{ fse.cwd_path, logical_path });
+    var components: std.fs.path.ComponentIterator(.posix, u8) = .init(path);
+    while (components.next()) |component| {
+        const info = Io.Dir.cwd().statFile(io, component.path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => break,
+            else => return err,
+        };
+        if (info.kind != .sym_link) continue;
+        if (symlinks == 40) return error.SymLinkLoop;
+        const parent = std.fs.path.dirname(component.path) orelse "/";
+        const real_parent = try Io.Dir.cwd().realPathFileAlloc(io, parent, arena);
+        try directories.put(gpa, real_parent, {});
+        // The physical target alone cannot notice an alias being retargeted.
+        try fse.addWatchPath(gpa, arena, try std.fs.path.join(arena, &.{ real_parent, component.name }), step_index, false);
+        var buffer: [Io.Dir.max_path_bytes]u8 = undefined;
+        const target = buffer[0..try Io.Dir.cwd().readLink(io, component.path, &buffer)];
+        const target_path = if (std.fs.path.isAbsolute(target)) target else try std.fs.path.join(arena, &.{ parent, target });
+        const remaining = path[component.path.len..];
+        return fse.addInputPath(maker, arena, directories, try std.fs.path.join(arena, &.{ target_path, remaining }), step_index, existence_only, symlinks + 1);
+    }
+    const directory = try @import("../Watch.zig").nearestDirectory(io, .{
+        .root_dir = .cwd(),
+        .sub_path = std.fs.path.dirname(path) orelse "/",
+    });
+    // Canonicalize at the OS boundary only, after symlink and .. traversal.
+    const real_dir = try directory.path.root_dir.handle.realPathFileAlloc(io, directory.path.subPathOrDot(), arena);
+    try directories.put(gpa, real_dir, {});
+    const basename = directory.basename orelse std.fs.path.basename(path);
+    const watch_path = if (std.mem.eql(u8, basename, ".")) real_dir else try std.fs.path.join(arena, &.{ real_dir, basename });
+    try fse.addWatchPath(gpa, arena, watch_path, step_index, existence_only or directory.basename != null);
+}
+
 const EventCallbackCtx = struct {
     fse: *FsEvents,
     maker: *Maker,
@@ -356,11 +423,27 @@ fn eventCallback(
         _ = event_id;
         if (event_flags.history_done) continue; // sentinel
         const event_path = std.mem.span(event_path_nts);
+        if (event_flags.item_created or event_flags.item_removed or event_flags.item_renamed or
+            event_flags.root_changed or event_flags.mount or event_flags.unmount)
+        {
+            // Replacing an ancestor can make a watched descendant disappear
+            // without an individual event for that descendant.
+            for (fse.watch_paths.keys(), fse.watch_paths.values()) |watching_path, steps| {
+                if (!dirStartsWith(watching_path, event_path)) continue;
+                if (invalidateSteps(maker, steps, true) catch |err| switch (err) {
+                    error.MustReconfigure => {
+                        fse.must_reconfigure = true;
+                        break;
+                    },
+                }) any_dirty = true;
+            }
+        }
         switch (event_flags.must_scan_sub_dirs) {
             false => {
                 if (fse.watch_paths.get(event_path)) |steps| {
-                    assert(steps.len > 0);
-                    if (invalidateSteps(maker, steps) catch |err| switch (err) {
+                    assert(steps.count() > 0);
+                    if (invalidateSteps(maker, steps, event_flags.item_created or event_flags.item_removed or event_flags.item_renamed or
+                        event_flags.root_changed or event_flags.mount or event_flags.unmount) catch |err| switch (err) {
                         error.MustReconfigure => {
                             fse.must_reconfigure = true;
                             break;
@@ -370,8 +453,8 @@ fn eventCallback(
                 if (std.fs.path.dirname(event_path)) |event_dirname| {
                     // Modifying '/foo/bar' triggers the watch on '/foo'.
                     if (fse.watch_paths.get(event_dirname)) |steps| {
-                        assert(steps.len > 0);
-                        if (invalidateSteps(maker, steps) catch |err| switch (err) {
+                        assert(steps.count() > 0);
+                        if (invalidateSteps(maker, steps, false) catch |err| switch (err) {
                             error.MustReconfigure => {
                                 fse.must_reconfigure = true;
                                 break;
@@ -389,7 +472,7 @@ fn eventCallback(
                 const changed_path = std.fs.path.dirname(event_path) orelse event_path;
                 for (fse.watch_paths.keys(), fse.watch_paths.values()) |watching_path, steps| {
                     if (dirStartsWith(watching_path, changed_path)) {
-                        if (invalidateSteps(maker, steps) catch |err| switch (err) {
+                        if (invalidateSteps(maker, steps, true) catch |err| switch (err) {
                             error.MustReconfigure => {
                                 fse.must_reconfigure = true;
                                 break;
@@ -408,13 +491,22 @@ fn eventCallback(
 fn dirStartsWith(path: []const u8, prefix: []const u8) bool {
     if (std.mem.eql(u8, path, prefix)) return true;
     if (!std.mem.startsWith(u8, path, prefix)) return false;
+    if (std.mem.eql(u8, prefix, "/")) return true;
     if (path[prefix.len] != '/') return false; // `path` is `/foo/barx`, `prefix` is `/foo/bar`
     return true; // `path` is `/foo/bar/...`, `prefix` is `/foo/bar`
 }
 
-fn invalidateSteps(maker: *Maker, steps: []const std.Build.Configuration.Step.Index) !bool {
+test "watch ancestor matching includes root but excludes sibling prefixes" {
+    try std.testing.expect(dirStartsWith("/", "/"));
+    try std.testing.expect(dirStartsWith("/nested/header.h", "/"));
+    try std.testing.expect(dirStartsWith("/nested/header.h", "/nested"));
+    try std.testing.expect(!dirStartsWith("/nested-other/header.h", "/nested"));
+}
+
+fn invalidateSteps(maker: *Maker, steps: StepSet, include_nodes: bool) !bool {
     var any_dirty = false;
-    for (steps) |step_index| {
+    for (steps.keys(), steps.values()) |step_index, existence_only| {
+        if (existence_only and !include_nodes) continue;
         const step = maker.stepByIndex(step_index);
         if (try maker.invalidateResult(step)) any_dirty = true;
     }
@@ -496,7 +588,11 @@ const FSEventStreamEventFlags = packed struct(u32) {
     root_changed: bool,
     mount: bool,
     unmount: bool,
-    _: u24 = 0,
+    item_created: bool,
+    item_removed: bool,
+    item_inode_metadata_modified: bool,
+    item_renamed: bool,
+    _: u20 = 0,
 };
 
 const dispatch = std.c.dispatch;

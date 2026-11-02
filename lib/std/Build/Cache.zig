@@ -455,7 +455,8 @@ pub const Manifest = struct {
             metadata_only: bool,
             exists: bool,
             prefix: PrefixIndex,
-            _: u2 = 0,
+            existence_only: bool,
+            _: u1 = 0,
         };
 
         /// Prefixes path names in encoded directory contents. Starts numbering
@@ -546,6 +547,13 @@ pub const Manifest = struct {
 
         fn hashFromMetadata(file: *File) void {
             var hasher = hasher_init;
+            if (file.flags.existence_only) {
+                // Different query outcomes can produce different artifacts even when no
+                // file contents are read. Ignore kind only while the path is absent.
+                hasher.update(&.{ @intFromBool(file.flags.exists), @intFromBool(file.flags.exists and file.flags.is_directory) });
+                hasher.final(&file.digest);
+                return;
+            }
             hasher.update(mem.asBytes(&file.size));
             hasher.update(mem.asBytes(&file.inode));
             hasher.update(mem.asBytes(&file.mtime));
@@ -730,6 +738,7 @@ pub const Manifest = struct {
             .is_directory = is_directory,
             .metadata_only = options.metadata_only,
             .exists = true, // modified later if necessary
+            .existence_only = false,
         };
 
         const gop = m.files.getOrPutAssumeCapacityContext(new_file_offset, .{ .contents = m.contents.items });
@@ -1219,7 +1228,7 @@ pub const Manifest = struct {
             } else |err| switch (err) {
                 error.Canceled => |e| return e,
 
-                error.FileNotFound => |e| if (input_file.flags.metadata_only) {
+                error.FileNotFound, error.NotDir => |e| if (input_file.flags.metadata_only) {
                     input_file.flags.exists = false;
                 } else return fail(diag, .{ .file_stat = .{
                     .file_offset = file_off,
@@ -1538,7 +1547,7 @@ pub const Manifest = struct {
 
         if (file.flags.metadata_only) {
             const actual_stat = parent_dir.statFile(io, file_path, .{}) catch |err| switch (err) {
-                error.FileNotFound => switch (file.flags.exists) {
+                error.FileNotFound, error.NotDir => switch (file.flags.exists) {
                     false => return .hit,
                     true => return .{ .path_deleted = file_off },
                 },
@@ -1555,6 +1564,7 @@ pub const Manifest = struct {
 
             const actual_is_directory = actual_stat.kind == .directory;
             if (actual_is_directory != file.flags.is_directory) return .{ .directory_status_changed = file_off };
+            if (file.flags.existence_only) return .hit;
 
             const changed = try file.setStatChanged(m, .init(actual_stat));
             file.hashFromMetadata();
@@ -1688,6 +1698,12 @@ pub const Manifest = struct {
 
     pub const AddDiscoveredPathOptions = struct {
         discovered_path: DiscoveredPath,
+        /// False records an already-observed absence without querying the filesystem again.
+        /// Requires metadata_only and no supplied handle, stat, or contents.
+        exists: bool = true,
+        /// Track existence and file-versus-directory kind, ignoring content and other metadata.
+        /// Requires metadata_only. A stronger dependency for the same path takes precedence.
+        existence_only: bool = false,
         handle: PathHandle = .{ .file = null },
         stat: ?Stat = null,
         /// If it is a directory, there is a special encoding required for contents, which
@@ -1705,6 +1721,7 @@ pub const Manifest = struct {
 
     pub const AddDiscoveredPathDiagnostic = union(enum) {
         none,
+        inconsistent_observations,
         open_file: Io.File.OpenError,
         open_dir: Io.Dir.OpenError,
         stat_file: Io.File.StatError,
@@ -1715,6 +1732,7 @@ pub const Manifest = struct {
         pub fn format(this: @This(), w: *Io.Writer) Io.Writer.Error!void {
             switch (this) {
                 .none => return w.writeAll("none"),
+                .inconsistent_observations => return w.writeAll("path changed during dependency collection"),
 
                 .open_file,
                 .open_dir,
@@ -1741,6 +1759,13 @@ pub const Manifest = struct {
     /// * `addDiscoveredManifest`
     pub fn addDiscoveredPath(m: *Manifest, options: AddDiscoveredPathOptions) AddDiscoveredPathError!void {
         assert(m.manifest_file != null);
+        assert(!options.existence_only or options.metadata_only);
+        if (!options.exists) {
+            assert(options.metadata_only);
+            assert(!options.handle.have());
+            assert(options.stat == null);
+            assert(options.contents == null);
+        }
         transitionToMissDiscovered(m);
         const cache = m.cache;
         const gpa = cache.gpa;
@@ -1762,7 +1787,8 @@ pub const Manifest = struct {
             .prefix = new_prefix,
             .is_directory = is_directory,
             .metadata_only = options.metadata_only,
-            .exists = true, // modified later if necessary
+            .exists = options.exists, // modified later if necessary
+            .existence_only = options.existence_only,
         };
 
         const gop = m.files.getOrPutAssumeCapacityContext(new_file_offset, .{ .contents = m.contents.items });
@@ -1773,16 +1799,44 @@ pub const Manifest = struct {
             m.contents.shrinkRetainingCapacity(@backingInt(new_file_offset));
             const existing_off = gop.key_ptr.*;
             const header = existing_off.get(m.contents.items);
+            if ((!options.exists and header.flags.exists) or
+                (options.stat != null and (!header.flags.exists or header.flags.is_directory != is_directory)))
+            {
+                if (options.diagnostic) |d| d.* = .inconsistent_observations;
+                return error.FileSystemFailure;
+            }
+            if ((!header.flags.metadata_only and options.metadata_only) or
+                (!header.flags.existence_only and options.existence_only))
+            {
+                if (options.stat) |stat| {
+                    // Zero inode/mtime values force a later content check because the
+                    // timestamp was unreliable. They are not observed metadata.
+                    if (!options.existence_only and (header.size != stat.size or
+                        (header.inode != 0 and header.inode != stat.inode) or
+                        (header.mtime != 0 and header.mtime != stat.mtime.toNanoseconds())))
+                    {
+                        if (options.diagnostic) |d| d.* = .inconsistent_observations;
+                        return error.FileSystemFailure;
+                    }
+                }
+                // Keep the digest and the metadata which produced it together.
+                return;
+            }
             // If it trips, the same file path has been added to the cache
             // manifest both as a directory and as a normal file, making the
             // intended caching behavior ambiguous.
             assert(header.flags.is_directory == is_directory);
             if (!options.metadata_only)
                 header.flags.metadata_only = false;
+            header.flags.existence_only = header.flags.existence_only and options.existence_only;
             break :h existing_off;
         } else new_file_offset;
 
         const header = file_offset.get(m.contents.items);
+        if (!options.exists) {
+            header.hashFromMetadata();
+            return;
+        }
 
         if (options.stat) |stat| {
             try header.setStat(m, stat);
@@ -1814,8 +1868,9 @@ pub const Manifest = struct {
                     try populateDirectory(m, header, need_stat, handle, options.contents, metadata_only, options.diagnostic);
                 } else |err| switch (err) {
                     error.Canceled => |e| return e,
-                    error.FileNotFound => |e| if (options.metadata_only) {
+                    error.FileNotFound, error.NotDir => |e| if (options.metadata_only) {
                         header.flags.exists = false;
+                        header.hashFromMetadata();
                     } else {
                         if (options.diagnostic) |d| d.* = .{ .open_dir = e };
                         return error.FileSystemFailure;
@@ -1837,8 +1892,9 @@ pub const Manifest = struct {
                     try populateFile(m, header, need_stat, handle, options.contents, metadata_only, options.diagnostic);
                 } else |err| switch (err) {
                     error.Canceled => |e| return e,
-                    error.FileNotFound => |e| if (options.metadata_only) {
+                    error.FileNotFound, error.NotDir => |e| if (options.metadata_only) {
                         header.flags.exists = false;
+                        header.hashFromMetadata();
                     } else {
                         if (options.diagnostic) |d| d.* = .{ .open_file = e };
                         return error.FileSystemFailure;
@@ -2162,7 +2218,11 @@ pub const Manifest = struct {
             for (files) |file| {
                 const file_path = file.path(contents);
                 try buf.ensureUnusedCapacity(gpa, file_path.len + 2);
-                buf.appendAssumeCapacity(@as(u8, file.get(contents).flags.prefix) + 1);
+                const flags = file.get(contents).flags;
+                buf.appendAssumeCapacity(@bitCast(std.zig.Server.Message.FileSystemInput{
+                    .prefix = @as(u7, flags.prefix) + 1,
+                    .existence_only = flags.existence_only,
+                }));
                 buf.appendSliceAssumeCapacity(file_path);
                 buf.appendAssumeCapacity(0);
             }
@@ -2205,18 +2265,24 @@ pub const Manifest = struct {
             const prev_contents_len: File.Offset = @fromBackingInt(@intCast(m.contents.items.len));
             try m.contents.appendSlice(gpa, copy_bytes);
 
+            // Remap before lookup so duplicates use this manifest's path identity.
+            const other_file = prev_contents_len.get(m.contents.items);
+            other_file.flags.prefix = @intCast(prefix_map[other_file.flags.prefix]);
             const gop = m.files.getOrPutAssumeCapacityContext(prev_contents_len, .{
                 .contents = m.contents.items,
             });
 
             if (gop.found_existing) {
+                const existing = gop.key_ptr.get(m.contents.items);
+                // A query from one compilation must not hide another compilation's
+                // dependency on metadata or contents of the same path.
+                if ((existing.flags.existence_only and !other_file.flags.existence_only) or
+                    (existing.flags.metadata_only and !other_file.flags.metadata_only))
+                {
+                    existing.* = other_file.*;
+                }
                 m.contents.shrinkRetainingCapacity(@backingInt(prev_contents_len));
-                continue;
             }
-
-            // Flags are already copied but the prefix is supposed to be filtered by `prefix_map`.
-            const other_file = prev_contents_len.get(m.contents.items);
-            other_file.flags.prefix = @intCast(prefix_map[other_file.flags.prefix]);
         }
     }
 
@@ -2826,4 +2892,314 @@ fn testMetadataAbsence(is_directory: bool, blocked_parent: bool, discovered: boo
 
 test "metadata-only absent input files and directories" {
     for ([_]bool{ false, true }) |is_directory| try testMetadataAbsence(is_directory, false, false);
+}
+
+test "metadata-only absent discovered files and directories" {
+    for ([_]bool{ false, true }) |is_directory| try testMetadataAbsence(is_directory, false, true);
+}
+
+test "metadata-only absent paths with non-directory parents" {
+    for ([_]bool{ false, true }) |is_directory| {
+        for ([_]bool{ false, true }) |discovered| {
+            try testMetadataAbsence(is_directory, true, discovered);
+        }
+    }
+}
+
+fn testObservedExistence(observed_exists: bool) !void {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    const directory: Directory = .{ .path = tmp_path, .handle = tmp.dir };
+    var cache: Cache = .{
+        .io = io,
+        .gpa = testing.allocator,
+        .manifest_dir = try tmp.dir.createDirPathOpen(io, "manifest", .{}),
+        .cwd = cwd,
+    };
+    cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+    cache.addPrefix(directory);
+    defer cache.manifest_dir.close(io);
+    const path: Path = .{ .root_dir = directory, .sub_path = "candidate.h" };
+    {
+        var man = cache.obtain();
+        defer man.deinit();
+        man.hash.addBytes("observed existence");
+        var diag: Manifest.CheckDiagnostic = undefined;
+        try testing.expectEqual(.incomplete_manifest, try man.check(&diag, .none));
+        try tmp.dir.writeFile(io, .{ .sub_path = "candidate.h", .data = "header" });
+        const observed_stat: ?Manifest.Stat = if (observed_exists)
+            .init(try tmp.dir.statFile(io, "candidate.h", .{}))
+        else
+            null;
+        if (observed_exists) try tmp.dir.deleteFile(io, "candidate.h");
+        // The on-disk state is now the opposite of the state observed by the compiler.
+        try man.addDiscoveredPath(.{
+            .discovered_path = .{ .unresolved = path },
+            .metadata_only = true,
+            .exists = observed_exists,
+            .stat = observed_stat,
+        });
+        _ = man.missDigest();
+        try man.finalize();
+    }
+    {
+        var man = cache.obtain();
+        defer man.deinit();
+        man.hash.addBytes("observed existence");
+        var diag: Manifest.CheckDiagnostic = undefined;
+        const status = try man.check(&diag, .none);
+        const expected: std.meta.Tag(Manifest.CheckResult) = if (observed_exists) .path_deleted else .path_created;
+        try testing.expectEqual(expected, std.meta.activeTag(status));
+    }
+}
+
+test "observed absence survives creation before manifest import" {
+    try testObservedExistence(false);
+}
+
+test "observed presence survives deletion before manifest import" {
+    try testObservedExistence(true);
+}
+
+fn testExistenceOnly(is_directory: bool, promote: bool) !void {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    const directory: Directory = .{ .path = tmp_path, .handle = tmp.dir };
+    var cache: Cache = .{
+        .io = io,
+        .gpa = testing.allocator,
+        .manifest_dir = try tmp.dir.createDirPathOpen(io, "manifest", .{}),
+        .cwd = cwd,
+    };
+    cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+    cache.addPrefix(directory);
+    // Compiler filesystem reports use all five standard root prefixes.
+    for (0..3) |_| cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+    defer cache.manifest_dir.close(io);
+    const path: Path = .{ .root_dir = directory, .sub_path = "candidate.h" };
+    if (is_directory) {
+        try tmp.dir.createDir(io, "candidate.h", .default_dir);
+    } else try tmp.dir.writeFile(io, .{ .sub_path = "candidate.h", .data = "initial" });
+    var first_digest: BinDigest = undefined;
+    for (0..3) |phase| {
+        if (phase == 1) {
+            try tmp.dir.writeFile(io, .{
+                .sub_path = if (is_directory) "candidate.h/unrelated" else "candidate.h",
+                .data = "different contents without changing existence or kind",
+            });
+        }
+        if (phase == 2) {
+            if (is_directory) {
+                try tmp.dir.deleteFile(io, "candidate.h/unrelated");
+                try tmp.dir.deleteDir(io, "candidate.h");
+                try tmp.dir.writeFile(io, .{ .sub_path = "candidate.h", .data = "now a header file" });
+            } else try tmp.dir.deleteFile(io, "candidate.h");
+        }
+        var man = cache.obtain();
+        defer man.deinit();
+        man.hash.addBytes("existence and kind");
+        var diag: Manifest.CheckDiagnostic = undefined;
+        const status = try man.check(&diag, .none);
+        const expected: std.meta.Tag(Manifest.CheckResult) = switch (phase) {
+            0 => .incomplete_manifest,
+            1 => if (promote) .contents_changed else .hit,
+            else => if (is_directory) .directory_status_changed else .path_deleted,
+        };
+        try testing.expectEqual(expected, std.meta.activeTag(status));
+        if (phase == 0 or phase == 2) {
+            try man.addDiscoveredPath(.{
+                .discovered_path = .{ .unresolved = path },
+                .handle = if (is_directory and phase == 0) .{ .dir = null } else .{ .file = null },
+                .exists = is_directory or phase != 2,
+                .metadata_only = true,
+                .existence_only = true,
+            });
+            if (promote) try man.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = path } });
+            var inputs: std.ArrayList(u8) = .empty;
+            defer inputs.deinit(testing.allocator);
+            try man.populateFileSystemInputs(&inputs);
+            const input: std.zig.Server.Message.FileSystemInput = @bitCast(inputs.items[0]);
+            try testing.expectEqual(@as(u7, 2), input.prefix);
+            try testing.expectEqual(!promote, input.existence_only);
+            const digest = man.missDigest();
+            if (phase == 0) first_digest = digest else try testing.expect(!mem.eql(u8, &first_digest, &digest));
+            try man.finalize();
+        } else if (status == .hit) {
+            try testing.expectEqualSlices(u8, &first_digest, &man.hitDigest());
+        }
+        // The promoted-file mutation already proves the stronger content dependency.
+        if (phase == 1 and promote) break;
+    }
+}
+
+test "existence-only directory ignores children but detects replacement by a file" {
+    try testExistenceOnly(true, false);
+}
+
+test "existence-only file ignores contents but detects deletion" {
+    try testExistenceOnly(false, false);
+}
+
+test "existence-only dependency is promoted to content tracking" {
+    try testExistenceOnly(false, true);
+}
+
+test "inconsistent dependency observations have a diagnostic" {
+    const diagnostic: Manifest.AddDiscoveredPathDiagnostic = .inconsistent_observations;
+    const message = try std.fmt.allocPrint(testing.allocator, "{f}", .{diagnostic});
+    defer testing.allocator.free(message);
+    try testing.expectEqualStrings("path changed during dependency collection", message);
+}
+
+fn testImportedDependencyPromotion(strong_first: bool, metadata_only: bool) !void {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    const directory: Directory = .{ .path = tmp_path, .handle = tmp.dir };
+    var cache: Cache = .{
+        .io = io,
+        .gpa = testing.allocator,
+        .manifest_dir = try tmp.dir.createDirPathOpen(io, "manifest", .{}),
+        .cwd = cwd,
+    };
+    cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+    cache.addPrefix(directory);
+    for (0..3) |_| cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+    defer cache.manifest_dir.close(io);
+    const path: Path = .{ .root_dir = directory, .sub_path = "candidate.h" };
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.h", .data = "initial" });
+    {
+        var query = cache.obtain();
+        defer query.deinit();
+        query.hash.addBytes("query");
+        var read = cache.obtain();
+        defer read.deinit();
+        read.hash.addBytes("read");
+        var whole = cache.obtain();
+        defer whole.deinit();
+        whole.hash.addBytes("whole");
+        var diag: Manifest.CheckDiagnostic = undefined;
+        try testing.expectEqual(.incomplete_manifest, try query.check(&diag, .none));
+        try testing.expectEqual(.incomplete_manifest, try read.check(&diag, .none));
+        try testing.expectEqual(.incomplete_manifest, try whole.check(&diag, .none));
+        try query.addDiscoveredPath(.{
+            .discovered_path = .{ .unresolved = path },
+            .metadata_only = true,
+            .existence_only = true,
+        });
+        try read.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = path }, .metadata_only = metadata_only });
+        try whole.addDiscoveredManifest(if (strong_first) &read else &query, .{ 0, 1, 2, 3, 4 });
+        try whole.addDiscoveredManifest(if (strong_first) &query else &read, .{ 0, 1, 2, 3, 4 });
+        try testing.expectEqual(@as(usize, 1), whole.files.count());
+        const flags = whole.files.keys()[0].get(whole.contents.items).flags;
+        try testing.expect(!flags.existence_only);
+        try testing.expectEqual(metadata_only, flags.metadata_only);
+        _ = whole.missDigest();
+        try whole.finalize();
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.h", .data = "modified contents and size" });
+    var whole = cache.obtain();
+    defer whole.deinit();
+    whole.hash.addBytes("whole");
+    var diag: Manifest.CheckDiagnostic = undefined;
+    const expected: std.meta.Tag(Manifest.CheckResult) = if (metadata_only) .metadata_changed else .contents_changed;
+    try testing.expectEqual(expected, std.meta.activeTag(try whole.check(&diag, .none)));
+}
+
+test "imported manifests preserve the strongest dependency in either order" {
+    for ([_]bool{ false, true }) |strong_first| {
+        for ([_]bool{ false, true }) |metadata_only| try testImportedDependencyPromotion(strong_first, metadata_only);
+    }
+}
+
+
+test "weaker discovered observations preserve content metadata" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    const directory: Directory = .{ .path = tmp_path, .handle = tmp.dir };
+    var cache: Cache = .{
+        .io = io,
+        .gpa = testing.allocator,
+        .manifest_dir = try tmp.dir.createDirPathOpen(io, "manifest", .{}),
+        .cwd = cwd,
+    };
+    cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+    cache.addPrefix(directory);
+    defer cache.manifest_dir.close(io);
+    const path: Path = .{ .root_dir = directory, .sub_path = "candidate.h" };
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.h", .data = "initial" });
+    var man = cache.obtain();
+    defer man.deinit();
+    _ = try man.addInputPath(path, .{});
+    var diag: Manifest.CheckDiagnostic = undefined;
+    try testing.expectEqual(.incomplete_manifest, try man.check(&diag, .none));
+    const off = man.files.keys()[0];
+    const original = off.get(man.contents.items).*;
+    const stat = Manifest.Stat.init(try tmp.dir.statFile(io, "candidate.h", .{}));
+    try man.addDiscoveredPath(.{
+        .discovered_path = .{ .unresolved = path },
+        .metadata_only = true,
+        .existence_only = true,
+        .stat = stat,
+    });
+    try testing.expectEqualDeep(original, off.get(man.contents.items).*);
+    try man.addDiscoveredPath(.{
+        .discovered_path = .{ .unresolved = path },
+        .metadata_only = true,
+        .stat = stat,
+    });
+    try testing.expectEqualDeep(original, off.get(man.contents.items).*);
+    try testing.expectError(error.FileSystemFailure, man.addDiscoveredPath(.{
+        .discovered_path = .{ .unresolved = path },
+        .handle = .{ .dir = null },
+        .metadata_only = true,
+        .existence_only = true,
+        .stat = .{ .size = 0, .inode = 0, .mtime = .zero },
+    }));
+    try testing.expectEqualDeep(original, off.get(man.contents.items).*);
+
+    // Directory existence queries carry no size/inode/mtime observation.
+    try tmp.dir.createDir(io, "include", .default_dir);
+    const directory_path: Path = .{ .root_dir = directory, .sub_path = "include" };
+    try man.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = directory_path }, .handle = .{ .dir = null } });
+    const directory_off = man.files.keys()[1];
+    const original_directory = directory_off.get(man.contents.items).*;
+    try man.addDiscoveredPath(.{
+        .discovered_path = .{ .unresolved = directory_path },
+        .handle = .{ .dir = null },
+        .metadata_only = true,
+        .existence_only = true,
+        .stat = .{ .size = 0, .inode = 0, .mtime = .zero },
+    });
+    try testing.expectEqualDeep(original_directory, directory_off.get(man.contents.items).*);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "candidate.h", .data = "changed contents and length" });
+    var observation_diag: Manifest.AddDiscoveredPathDiagnostic = .none;
+    try testing.expectError(error.FileSystemFailure, man.addDiscoveredPath(.{
+        .discovered_path = .{ .unresolved = path },
+        .metadata_only = true,
+        .stat = Manifest.Stat.init(try tmp.dir.statFile(io, "candidate.h", .{})),
+        .diagnostic = &observation_diag,
+    }));
+    try testing.expectEqual(.inconsistent_observations, observation_diag);
+    try testing.expectEqualDeep(original, off.get(man.contents.items).*);
 }
