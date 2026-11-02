@@ -18208,3 +18208,28 @@ extern fn c_check_conditional_return() void;
 test "conditional early return through C" {
     c_check_conditional_return();
 }
+
+const ExternOffsetTable = extern struct { first: i64, second: i64, padding: [4096]u8, last: i64 };
+extern var c_extern_offset_table: ExternOffsetTable;
+export fn zig_extern_offset_first() callconv(.c) i64 {
+    return c_extern_offset_table.first;
+}
+export fn zig_extern_offset_second() callconv(.c) i64 {
+    return c_extern_offset_table.second;
+}
+export fn zig_extern_offset_last() callconv(.c) i64 {
+    return c_extern_offset_table.last;
+}
+export fn zig_extern_offset_second_ptr() callconv(.c) *i64 {
+    return &c_extern_offset_table.second;
+}
+export fn zig_extern_offset_last_ptr() callconv(.c) *i64 {
+    return &c_extern_offset_table.last;
+}
+export fn zig_extern_offset_set_second(value: i64) callconv(.c) void {
+    c_extern_offset_table.second = value;
+}
+extern fn c_check_extern_offsets() void;
+test "external global offsets through C" {
+    c_check_extern_offsets();
+}
