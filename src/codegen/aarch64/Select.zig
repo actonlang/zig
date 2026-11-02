@@ -4527,7 +4527,7 @@ pub fn body(isel: *Select, air_body: []const Air.Inst.Index) codegen.Error!void 
 
             const cond_vi = try isel.use(cond_br.condition);
             const cond_mat = try cond_vi.matReg(isel);
-            try isel.emit(.tbz(
+            try isel.emit(.tbnz(
                 cond_mat.ra.x(),
                 0,
                 @intCast((isel.instructions.items.len + 1 - else_label) << 2),

@@ -18189,3 +18189,22 @@ test "preserve_most calling convention" {
     try expect(static.c_preserve_most(41) == 42);
     static.c_preserve_most_check();
 }
+
+var conditional_done: bool = false;
+var conditional_value: c_int = 0;
+export fn zig_conditional_initialize() void {
+    if (conditional_done) return;
+    conditional_done = true;
+    conditional_value = 42;
+}
+export fn zig_conditional_value() c_int {
+    return conditional_value;
+}
+export fn zig_conditional_return(n: c_int) c_int {
+    if (n != 0) return 7;
+    return 42;
+}
+extern fn c_check_conditional_return() void;
+test "conditional early return through C" {
+    c_check_conditional_return();
+}
