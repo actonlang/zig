@@ -6,6 +6,7 @@ base: link.File,
 
 all_inputs: std.ArrayList(link.Input),
 flushed_once: bool = false,
+parsed_objects: std.ArrayList(?ParsedObject) = .empty,
 
 rpath_list: []const []const u8,
 
@@ -140,6 +141,8 @@ discard_local_symbols: bool = false,
 
 /// Hot-code swapping state.
 hot_state: if (is_hot_update_compatible) HotUpdateState else struct {} = .{},
+
+const ParsedObject = struct { object: Object, stat: Io.File.Stat };
 
 /// When adding a new field, remember to update `hashAddFrameworks`.
 pub const Framework = struct {
@@ -285,6 +288,8 @@ pub fn deinit(self: *MachO) void {
         .dylib => data.dylib.deinit(gpa),
     };
     self.files.deinit(gpa);
+    for (self.parsed_objects.items) |*entry| if (entry.*) |*snapshot| snapshot.object.deinit(gpa);
+    self.parsed_objects.deinit(gpa);
     self.objects.deinit(gpa);
     self.dylibs.deinit(gpa);
 
@@ -923,8 +928,42 @@ pub fn parseInputFiles(self: *MachO) !void {
     if (diags.hasErrors()) return error.AlreadyReported;
 }
 
+fn parseCachedInputFile(self: *MachO, file: File) !void {
+    if (file != .object) return file.parse(self);
+    const object = file.object;
+    const gpa = self.base.comp.gpa;
+    const stat = try self.getFileHandle(object.file_handle).stat(self.base.comp.io);
+    const index = object.index;
+    if (index >= self.parsed_objects.items.len) {
+        const old_len = self.parsed_objects.items.len;
+        try self.parsed_objects.resize(gpa, index + 1);
+        @memset(self.parsed_objects.items[old_len..], null);
+    }
+    const slot = &self.parsed_objects.items[index];
+    if (slot.*) |*saved| {
+        const same_archive = if (saved.object.in_archive) |a|
+            if (object.in_archive) |b| mem.eql(u8, a.path, b.path) and a.size == b.size else false
+        else
+            object.in_archive == null;
+        if (saved.stat.inode == stat.inode and saved.stat.size == stat.size and
+            std.meta.eql(saved.stat.mtime, stat.mtime) and std.meta.eql(saved.stat.ctime, stat.ctime) and
+            saved.object.offset == object.offset and mem.eql(u8, saved.object.path, object.path) and same_archive)
+        {
+            var copy = try saved.object.cloneParsed(gpa);
+            copy.file_handle = object.file_handle;
+            object.deinit(gpa);
+            object.* = copy;
+            return;
+        }
+        saved.object.deinit(gpa);
+        slot.* = null;
+    }
+    try file.parse(self);
+    slot.* = .{ .object = try object.cloneParsed(gpa), .stat = stat };
+}
+
 fn parseInputFileWorker(self: *MachO, file: File) void {
-    file.parse(self) catch |err| {
+    self.parseCachedInputFile(file) catch |err| {
         switch (err) {
             error.MalformedObject,
             error.MalformedDylib,
