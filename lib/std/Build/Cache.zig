@@ -1092,7 +1092,11 @@ pub const Manifest = struct {
         for (m.input_paths.items, m.files.keys()[0..m.input_paths.items.len], 0..) |*input_path, file_off, i| {
             if (@backingInt(file_off) + 1 >= disk_contents.len)
                 return missInput(m, diag, i, input_contents_len, manifest_size, .incomplete_manifest);
-            if (!mem.eql(u8, file_off.flagsAndPath(disk_contents), file_off.flagsAndPath(input_contents)))
+            // Existence is an observed state, not part of the input's configuration.
+            var disk_flags = file_off.get(disk_contents).flags;
+            const input_flags = file_off.get(input_contents).flags;
+            disk_flags.exists = input_flags.exists;
+            if (disk_flags != input_flags or !mem.eql(u8, file_off.path(disk_contents), file_off.path(input_contents)))
                 return missInput(m, diag, i, input_contents_len, manifest_size, .invalid_manifest);
 
             const result = try checkInputPath(m, diag, file_off, input_path, disk_contents, input_contents);
@@ -1362,7 +1366,23 @@ pub const Manifest = struct {
         const parent_dir = cache.prefixes()[disk_file.flags.prefix].handle;
         const file_path = file_off.pathOrDot(disk_contents);
 
-        assert(disk_file.flags == input_file.flags);
+        var disk_flags = disk_file.flags;
+        disk_flags.exists = input_file.flags.exists;
+        assert(disk_flags == input_file.flags);
+
+        if (disk_file.flags.metadata_only) {
+            try populateInputPath(m, diag, file_off, input_path, input_contents);
+            const result: CheckResult = if (disk_file.flags.exists != input_file.flags.exists)
+                if (input_file.flags.exists) .{ .path_created = file_off } else .{ .path_deleted = file_off }
+            else if (!input_file.flags.exists or
+                (disk_file.size == input_file.size and disk_file.inode == input_file.inode and disk_file.mtime == input_file.mtime))
+                .hit
+            else
+                .{ .metadata_changed = file_off };
+            // missInput preserves this entry, so it must contain the newly observed state.
+            disk_file.* = input_file.*;
+            return result;
+        }
 
         if (input_path.have_digest) {
             if (mem.eql(u8, &disk_file.digest, &input_file.digest))
@@ -1372,54 +1392,8 @@ pub const Manifest = struct {
         // space to compute the digest in case stat changed, in order to compare with `disk_file.digest`.
 
         if (input_path.have_stat) {
-            if (!disk_file.flags.exists) {
-                return .{ .path_created = file_off };
-            }
             const changed = try disk_file.setStatChanged(m, input_file.stat());
             if (!changed) return .hit;
-        }
-
-        if (disk_file.flags.metadata_only) {
-            if (!input_path.have_stat) {
-                // Since this is an input file, FileNotFound counts as a failure, not a cache miss.
-                const stat_result = switch (input_path.getHandle(input_file)) {
-                    .none => parent_dir.statFile(io, file_path, .{}),
-                    .file => |opened_file| opened_file.stat(io),
-                    .dir => |opened_dir| opened_dir.stat(io),
-                };
-                const actual_stat = stat_result catch |err| switch (err) {
-                    error.Canceled => |e| return e,
-                    error.FileNotFound => |e| switch (disk_file.flags.exists) {
-                        false => return .hit,
-                        true => return fail(diag, .{ .file_stat = .{
-                            .file_offset = file_off,
-                            .err = e,
-                        } }),
-                    },
-                    else => |e| return fail(diag, .{ .file_stat = .{
-                        .file_offset = file_off,
-                        .err = e,
-                    } }),
-                };
-                if (!disk_file.flags.exists) {
-                    return .{ .path_created = file_off };
-                }
-                // In the other case (have_stat=true), this check is redundant since we already asserted the flags are
-                // identical, which contains the prefix.
-                const actual_is_directory = actual_stat.kind == .directory;
-                if (actual_is_directory != disk_file.flags.is_directory) {
-                    // Since this is an input file, this is a failure, not a cache miss.
-                    return fail(diag, .{ .file_stat = .{
-                        .file_offset = file_off,
-                        .err = if (actual_is_directory) error.IsDir else error.NotDir,
-                    } });
-                }
-                const stat: Stat = .init(actual_stat);
-                const changed = try disk_file.setStatChanged(m, stat);
-                disk_file.hashFromMetadata();
-                if (!changed) return .hit;
-            }
-            return .{ .metadata_changed = file_off };
         }
 
         if (input_path.contents.get(m.all_input_content.items)) |file_or_dir_contents| {
@@ -2788,4 +2762,68 @@ test {
     _ = Path;
     _ = Directory;
     _ = DepTokenizer;
+}
+
+fn testMetadataAbsence(is_directory: bool, blocked_parent: bool, discovered: bool) !void {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    const directory: Directory = .{ .path = tmp_path, .handle = tmp.dir };
+    var cache: Cache = .{
+        .io = io,
+        .gpa = testing.allocator,
+        .manifest_dir = try tmp.dir.createDirPathOpen(io, "manifest", .{}),
+        .cwd = cwd,
+    };
+    cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+    cache.addPrefix(directory);
+    defer cache.manifest_dir.close(io);
+    const path: Path = .{ .root_dir = directory, .sub_path = "parent/candidate" };
+    const handle: Manifest.PathHandle = if (is_directory) .{ .dir = null } else .{ .file = null };
+    if (blocked_parent) try tmp.dir.writeFile(io, .{ .sub_path = "parent", .data = "not a directory" });
+    for (0..7) |phase| {
+        if (phase == 2) try tmp.dir.writeFile(io, .{ .sub_path = "unrelated", .data = "unchanged lookup" });
+        if (phase == 3) {
+            if (blocked_parent) try tmp.dir.deleteFile(io, "parent");
+            try tmp.dir.createDir(io, "parent", .default_dir);
+            if (is_directory) {
+                try tmp.dir.createDir(io, "parent/candidate", .default_dir);
+            } else try tmp.dir.writeFile(io, .{ .sub_path = "parent/candidate", .data = "now present" });
+        }
+        if (phase == 5) {
+            if (is_directory) try tmp.dir.deleteDir(io, "parent/candidate") else try tmp.dir.deleteFile(io, "parent/candidate");
+        }
+        var man = cache.obtain();
+        defer man.deinit();
+        man.hash.addBytes("metadata absence");
+        if (!discovered) _ = try man.addInputPath(path, .{ .handle = handle, .metadata_only = true });
+        var diag: Manifest.CheckDiagnostic = undefined;
+        const status = try man.check(&diag, .none);
+        const expected: std.meta.Tag(Manifest.CheckResult) = switch (phase) {
+            0 => .incomplete_manifest,
+            3 => .path_created,
+            5 => .path_deleted,
+            else => .hit,
+        };
+        try testing.expectEqual(expected, std.meta.activeTag(status));
+        if (status == .hit) {
+            _ = man.hitDigest();
+        } else {
+            if (discovered) try man.addDiscoveredPath(.{
+                .discovered_path = .{ .unresolved = path },
+                .handle = handle,
+                .metadata_only = true,
+            });
+            _ = man.missDigest();
+            try man.finalize();
+        }
+    }
+}
+
+test "metadata-only absent input files and directories" {
+    for ([_]bool{ false, true }) |is_directory| try testMetadataAbsence(is_directory, false, false);
 }
