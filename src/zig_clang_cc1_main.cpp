@@ -28,6 +28,7 @@
 #include "clang/Options/Options.h"
 #include "clang/Serialization/ObjectFilePCHContainerReader.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Config/llvm-config.h"
 #include "llvm/LinkAllPasses.h"
@@ -39,6 +40,7 @@
 #include "llvm/Support/BuryPointer.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/Endian.h"
 #include "llvm/Support/IOSandbox.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/Path.h"
@@ -216,8 +218,136 @@ static int PrintEnabledExtensions(const TargetOptions& TargetOpts) {
   return 0;
 }
 
+// Record physical filesystem queries, including failed candidates which do not
+// appear in Clang's make-style dependency file. Wrapping below VFS overlays
+// keeps their backing paths visible without treating virtual paths as files.
+class ZigCacheFileSystem final : public llvm::vfs::ProxyFileSystem {
+  struct Input {
+    char Kind;
+    uint64_t Size = 0;
+    uint64_t Inode = 0;
+    int64_t MTime = 0;
+
+    bool agreesWith(const Input &Other) const {
+      const bool BothFiles = (Kind == 'f' || Kind == 'r') &&
+                             (Other.Kind == 'f' || Other.Kind == 'r');
+      return (Kind == Other.Kind || BothFiles) && Size == Other.Size &&
+             Inode == Other.Inode && MTime == Other.MTime;
+    }
+  };
+  llvm::StringMap<Input> Inputs;
+  bool Changed = false;
+
+  void record(const Twine &Path, Input Value) {
+    SmallString<256> Absolute;
+    Path.toVector(Absolute);
+    if (makeAbsolute(Absolute)) {
+      Changed = true;
+      return;
+    }
+    auto Entry = Inputs.try_emplace(Absolute, Value);
+    if (!Entry.second) {
+      if (!Entry.first->second.agreesWith(Value))
+        Changed = true;
+      else if (Value.Kind == 'r')
+        Entry.first->second.Kind = 'r';
+    }
+  }
+
+  void recordError(const Twine &Path, std::error_code EC) {
+    if (EC == std::errc::no_such_file_or_directory ||
+        EC == std::errc::not_a_directory)
+      record(Path, {'m'});
+  }
+
+  void recordFile(const Twine &Path, const llvm::vfs::Status &Stat,
+                  bool Opened = false) {
+    if (Stat.isDirectory())
+      record(Path, {'d'});
+    else if (Stat.isRegularFile())
+      record(Path, {Opened ? 'r' : 'f', Stat.getSize(), Stat.getUniqueID().getFile(),
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        Stat.getLastModificationTime().time_since_epoch()).count()});
+  }
+
+public:
+  explicit ZigCacheFileSystem(IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS)
+      : ProxyFileSystem(std::move(FS)) {}
+
+  llvm::ErrorOr<llvm::vfs::Status> status(const Twine &Path) override {
+    auto Result = getUnderlyingFS().status(Path);
+    if (!Result)
+      recordError(Path, Result.getError());
+    else
+      recordFile(Path, *Result);
+    return Result;
+  }
+
+  bool exists(const Twine &Path) override { return bool(status(Path)); }
+
+  llvm::ErrorOr<std::unique_ptr<llvm::vfs::File>>
+  openFileForRead(const Twine &Path) override {
+    auto Result = getUnderlyingFS().openFileForRead(Path);
+    if (!Result)
+      recordError(Path, Result.getError());
+    else {
+      auto Stat = (*Result)->status();
+      if (Stat)
+        recordFile(Path, *Stat, true);
+    }
+    return Result;
+  }
+
+  bool write(StringRef Output) {
+    if (Changed) {
+      llvm::errs() << "filesystem inputs changed while compiling C source\n";
+      return false;
+    }
+    std::error_code EC;
+    llvm::raw_fd_ostream OS(Output, EC);
+    if (EC) {
+      llvm::errs() << "cannot write Zig cache dependencies: " << EC.message() << '\n';
+      return false;
+    }
+    // Preserve the observed metadata, so a file created or removed during
+    // compilation cannot turn an old result into a valid cache entry.
+    for (const auto &Entry : Inputs) {
+      const auto &Input = Entry.second;
+      char Header[25] = {};
+      Header[0] = Input.Kind;
+      llvm::support::endian::write64le(Header + 1, Input.Size);
+      llvm::support::endian::write64le(Header + 9, Input.Inode);
+      llvm::support::endian::write64le(Header + 17, Input.MTime);
+      OS.write(Header, sizeof(Header));
+      OS << Entry.first() << '\0';
+    }
+    OS.close();
+    if (OS.has_error()) {
+      llvm::errs() << "cannot write Zig cache dependencies\n";
+      OS.clear_error();
+      return false;
+    }
+    return true;
+  }
+};
+
 int cc1_main(ArrayRef<const char *> Argv, const char *Argv0, void *MainAddr) {
   ensureSufficientStack();
+
+  StringRef CacheDependencies;
+  SmallVector<const char *, 256> FilteredArgs;
+  for (size_t I = 0; I < Argv.size(); ++I) {
+    if (StringRef(Argv[I]) == "-zig-cache-dependencies") {
+      if (++I == Argv.size()) {
+        llvm::errs() << "missing Zig cache dependency output path\n";
+        return 1;
+      }
+      CacheDependencies = Argv[I];
+    } else {
+      FilteredArgs.push_back(Argv[I]);
+    }
+  }
+  Argv = FilteredArgs;
 
   IntrusiveRefCntPtr<DiagnosticIDs> DiagID = DiagnosticIDs::create();
 
@@ -278,6 +408,11 @@ int cc1_main(ArrayRef<const char *> Argv, const char *Argv0, void *MainAddr) {
     auto BypassSandbox = llvm::sys::sandbox::scopedDisable();
     return llvm::vfs::getRealFileSystem();
   }();
+  IntrusiveRefCntPtr<ZigCacheFileSystem> CacheFS;
+  if (!CacheDependencies.empty()) {
+    CacheFS = new ZigCacheFileSystem(std::move(VFS));
+    VFS = CacheFS;
+  }
   Clang->createVirtualFileSystem(std::move(VFS), DiagsBuffer);
 
   // Create the actual diagnostics engine.
@@ -294,6 +429,9 @@ int cc1_main(ArrayRef<const char *> Argv, const char *Argv0, void *MainAddr) {
 
   // Execute the frontend actions.
   Success = ExecuteCompilerInvocation(Clang.get());
+
+  if (Success && CacheFS)
+    Success = CacheFS->write(CacheDependencies);
 
   // If any timers were active but haven't been destroyed yet, print their
   // results now.  This happens in -disable-free mode.
