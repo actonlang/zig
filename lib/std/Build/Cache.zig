@@ -1951,19 +1951,29 @@ pub const Manifest = struct {
         defer aux.deinit(gpa);
 
         var it: DepTokenizer = .{ .bytes = m.all_input_content.items[prev_len..] };
-        while (it.next()) |token| switch (token) {
-            .target, .target_must_resolve => {},
-            .prereq => |p| try m.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = .initCwd(p) } }),
-            .prereq_must_resolve => {
-                aux.clearRetainingCapacity();
-                try token.resolve(gpa, &aux);
-                try m.addDiscoveredPath(.{ .discovered_path = .{ .unresolved = .initCwd(aux.items) } });
-            },
-            else => |err| {
-                if (diagnostic) |d| d.* = .{ .dep_tokenizer = err };
-                return error.InvalidDepFile;
-            },
-        };
+        while (it.next()) |token| {
+            const prereq = switch (token) {
+                .target, .target_must_resolve => continue,
+                .prereq => |p| p,
+                .prereq_must_resolve => blk: {
+                    aux.clearRetainingCapacity();
+                    try token.resolve(gpa, &aux);
+                    break :blk aux.items;
+                },
+                else => |err| {
+                    if (diagnostic) |d| d.* = .{ .dep_tokenizer = err };
+                    return error.InvalidDepFile;
+                },
+            };
+            // A lexical normalization of symlink/.. can name a different file.
+            // Make relative prerequisites absolute without removing components.
+            const absolute = if (std.fs.path.isAbsolute(prereq))
+                try gpa.dupe(u8, prereq)
+            else
+                try std.fs.path.join(gpa, &.{ cache.cwd, prereq });
+            defer gpa.free(absolute);
+            try m.addDiscoveredPath(.{ .discovered_path = .{ .prefixed = .{ .prefix = 0, .sub_path = absolute } } });
+        }
     }
 
     fn populateFile(
@@ -3126,6 +3136,67 @@ test "imported manifests preserve the strongest dependency in either order" {
     }
 }
 
+fn testDepFileLogicalPath(absolute: bool) !void {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    const directory: Directory = .{ .path = tmp_path, .handle = tmp.dir };
+    var cache: Cache = .{
+        .io = io,
+        .gpa = testing.allocator,
+        .manifest_dir = try tmp.dir.createDirPathOpen(io, "manifest", .{}),
+        .cwd = tmp_path,
+    };
+    cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+    cache.addPrefix(directory);
+    defer cache.manifest_dir.close(io);
+    try tmp.dir.createDirPath(io, "include");
+    try tmp.dir.createDirPath(io, "target/nested");
+    try tmp.dir.writeFile(io, .{ .sub_path = "include/value.h", .data = "unchanged lexical sentinel" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "target/value.h", .data = "actual header" });
+    tmp.dir.symLink(io, "../target/nested", "include/link", .{ .is_directory = true }) catch |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied, error.FileSystem => if (builtin.os.tag == .windows) return error.SkipZigTest else return err,
+        else => return err,
+    };
+    const prerequisite = if (absolute)
+        try std.fs.path.join(testing.allocator, &.{ tmp_path, "include/link/../value.h" })
+    else
+        try testing.allocator.dupe(u8, "include/link/../value.h");
+    defer testing.allocator.free(prerequisite);
+    const depfile = try std.fmt.allocPrint(testing.allocator, "object.o: {s}\n", .{prerequisite});
+    defer testing.allocator.free(depfile);
+    try tmp.dir.writeFile(io, .{ .sub_path = "object.d", .data = depfile });
+    var original_digest: BinDigest = undefined;
+    for (0..3) |phase| {
+        if (phase == 2) try tmp.dir.writeFile(io, .{ .sub_path = "target/value.h", .data = "changed actual header contents" });
+        var man = cache.obtain();
+        defer man.deinit();
+        man.hash.addBytes("depfile logical path");
+        var diag: Manifest.CheckDiagnostic = undefined;
+        const result = try man.check(&diag, .none);
+        const expected: std.meta.Tag(Manifest.CheckResult) = switch (phase) {
+            0 => .incomplete_manifest,
+            1 => .hit,
+            else => .contents_changed,
+        };
+        try testing.expectEqual(expected, std.meta.activeTag(result));
+        if (result == .hit) {
+            try testing.expectEqualSlices(u8, &original_digest, &man.hitDigest());
+        } else {
+            try man.addDiscoveredDepFile(.{ .root_dir = directory, .sub_path = "object.d" }, null);
+            const digest = man.missDigest();
+            if (phase == 0) original_digest = digest else try testing.expect(!mem.eql(u8, &original_digest, &digest));
+            try man.finalize();
+        }
+    }
+}
+
+test "depfile paths preserve symlink parent components" {
+    try testDepFileLogicalPath(false);
+    try testDepFileLogicalPath(true);
+}
 
 test "weaker discovered observations preserve content metadata" {
     const io = testing.io;
