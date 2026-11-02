@@ -1167,12 +1167,8 @@ pub const File = struct {
         const io = base.comp.io;
         const diags = &base.comp.link_diags;
         var input = try openObjectInput(io, diags, path);
-        errdefer input.object.file.close(io);
         input.object.c_object = c_object;
-        try loadInput(base, input);
-        // Old Mach-O stores input metadata and reopens paths at flush. It does
-        // not take ownership of this temporary loader handle.
-        if (base.tag == .macho) input.object.file.close(io);
+        try loadOwnedInput(base, input);
     }
 
     /// Opens a path as a static library and parses it into the linker.
@@ -1180,8 +1176,7 @@ pub const File = struct {
         if (base.tag == .lld) return;
         const io = base.comp.io;
         const archive = try openObject(io, path, must_link, false);
-        errdefer archive.file.close(io);
-        try loadInput(base, .{ .archive = archive });
+        try loadOwnedInput(base, .{ .archive = archive });
     }
 
     /// Opens a path as a static library and parses it into the linker. Allows GNU ld scripts.
@@ -1199,6 +1194,7 @@ pub const File = struct {
             },
             else => return err,
         };
+        if (base.tag == .macho) archive.file.close(io);
     }
 
     /// Opens a path as a shared library and parses it into the linker.
@@ -1217,6 +1213,7 @@ pub const File = struct {
             },
             else => return err,
         };
+        if (base.tag == .macho) dso.file.close(io);
     }
 
     fn loadGnuLdScript(base: *File, path: Path, parent_query: UnresolvedInput.Query, file: Io.File) anyerror!void {
@@ -1261,6 +1258,18 @@ pub const File = struct {
                 }
             }
         }
+    }
+
+    /// Submit a newly opened input, transferring its handle to the linker.
+    /// Old Mach-O keeps only metadata and opens its own handle during flush.
+    /// Explicit compilation inputs call loadInput directly because their cache
+    /// manifests still borrow the original handles.
+    fn loadOwnedInput(base: *File, input: Input) anyerror!void {
+        const io = base.comp.io;
+        const file = input.pathAndFile()[1];
+        errdefer file.close(io);
+        try loadInput(base, input);
+        if (base.tag == .macho) file.close(io);
     }
 
     pub fn loadInput(base: *File, input: Input) anyerror!void {
@@ -1623,8 +1632,7 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
                                 .{ crt_dir, target.libPrefix(), lib_name },
                             ) catch return diags.setAllocFailure());
                             if (tbd_path.root_dir.handle.openFile(io, tbd_path.sub_path, .{})) |file| {
-                                errdefer file.close(io);
-                                base.loadInput(.{ .tbd = .{
+                                base.loadOwnedInput(.{ .tbd = .{
                                     .path = tbd_path,
                                     .file = file,
                                     .needed = false,
@@ -1800,8 +1808,7 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
             const prog_node = comp.link_prog_node.start("Parse Shared Library Stub", 0);
             defer prog_node.end();
             if (path.root_dir.handle.openFile(io, path.sub_path, .{})) |file| {
-                errdefer file.close(io);
-                base.loadInput(.{ .tbd = .{
+                base.loadOwnedInput(.{ .tbd = .{
                     .path = path,
                     .file = file,
                     .needed = false,
