@@ -1747,7 +1747,8 @@ pub const Manifest = struct {
 
     pub const AddDiscoveredPathError = error{
         /// If this is returned, diagnostic will be populated.
-        /// If contents and stat are both provided, this is unreachable.
+        /// Supplied contents and stat avoid filesystem access, but can still
+        /// conflict with a previous dependency observation.
         FileSystemFailure,
     } || Allocator.Error || Io.Cancelable;
 
@@ -1795,6 +1796,7 @@ pub const Manifest = struct {
         m.files.lockPointers();
         defer m.files.unlockPointers();
 
+        var observed_file: ?File = null;
         const file_offset = if (gop.found_existing) h: {
             m.contents.shrinkRetainingCapacity(@backingInt(new_file_offset));
             const existing_off = gop.key_ptr.*;
@@ -1826,6 +1828,8 @@ pub const Manifest = struct {
             // manifest both as a directory and as a normal file, making the
             // intended caching behavior ambiguous.
             assert(header.flags.is_directory == is_directory);
+            if (header.flags.metadata_only and !header.flags.existence_only and !options.metadata_only)
+                observed_file = header.*;
             if (!options.metadata_only)
                 header.flags.metadata_only = false;
             header.flags.existence_only = header.flags.existence_only and options.existence_only;
@@ -1833,19 +1837,31 @@ pub const Manifest = struct {
         } else new_file_offset;
 
         const header = file_offset.get(m.contents.items);
+        // A failed promotion must leave the original observation intact.
+        errdefer if (observed_file) |previous| {
+            header.* = previous;
+        };
+        const observed_stat = if (observed_file) |previous| previous.stat() else null;
         if (!options.exists) {
             header.hashFromMetadata();
             return;
         }
 
         if (options.stat) |stat| {
-            try header.setStat(m, stat);
+            try validateObservedStat(observed_stat, stat, options.diagnostic);
             if (header.flags.metadata_only) {
+                // This is an explicitly supplied observation, not metadata used
+                // to skip a content hash. Retain even an unreliable timestamp
+                // so a later content promotion can validate the same snapshot.
+                header.setStatUnchecked(stat);
                 header.hashFromMetadata();
-            } else if (options.contents) |contents| {
-                var hasher = hasher_init;
-                hasher.update(contents);
-                hasher.final(&header.digest);
+            } else {
+                try header.setStat(m, stat);
+                if (options.contents) |contents| {
+                    var hasher = hasher_init;
+                    hasher.update(contents);
+                    hasher.final(&header.digest);
+                }
             }
             return;
         }
@@ -1856,7 +1872,7 @@ pub const Manifest = struct {
 
         switch (options.handle) {
             .dir => |opt_handle| if (opt_handle) |handle| {
-                try populateDirectory(m, header, need_stat, handle, options.contents, metadata_only, options.diagnostic);
+                try populateDirectory(m, header, need_stat, handle, options.contents, metadata_only, observed_stat, options.diagnostic);
             } else {
                 const dir = cache.prefixes()[prefix].handle;
                 const sub_path = file_offset.path(m.contents.items);
@@ -1865,7 +1881,7 @@ pub const Manifest = struct {
                     .iterate = true,
                 })) |handle| {
                     defer handle.close(io);
-                    try populateDirectory(m, header, need_stat, handle, options.contents, metadata_only, options.diagnostic);
+                    try populateDirectory(m, header, need_stat, handle, options.contents, metadata_only, observed_stat, options.diagnostic);
                 } else |err| switch (err) {
                     error.Canceled => |e| return e,
                     error.FileNotFound, error.NotDir => |e| if (options.metadata_only) {
@@ -1883,13 +1899,13 @@ pub const Manifest = struct {
             },
 
             .file => |opt_handle| if (opt_handle) |handle| {
-                try populateFile(m, header, need_stat, handle, options.contents, metadata_only, options.diagnostic);
+                try populateFile(m, header, need_stat, handle, options.contents, metadata_only, observed_stat, options.diagnostic);
             } else {
                 const dir = cache.prefixes()[prefix].handle;
                 const sub_path = file_offset.path(m.contents.items);
                 if (dir.openFile(io, sub_path, .{ .mode = .read_only })) |handle| {
                     defer handle.close(io);
-                    try populateFile(m, header, need_stat, handle, options.contents, metadata_only, options.diagnostic);
+                    try populateFile(m, header, need_stat, handle, options.contents, metadata_only, observed_stat, options.diagnostic);
                 } else |err| switch (err) {
                     error.Canceled => |e| return e,
                     error.FileNotFound, error.NotDir => |e| if (options.metadata_only) {
@@ -1972,8 +1988,26 @@ pub const Manifest = struct {
             else
                 try std.fs.path.join(gpa, &.{ cache.cwd, prereq });
             defer gpa.free(absolute);
-            try m.addDiscoveredPath(.{ .discovered_path = .{ .prefixed = .{ .prefix = 0, .sub_path = absolute } } });
+            var path_diagnostic: AddDiscoveredPathDiagnostic = .none;
+            m.addDiscoveredPath(.{
+                .discovered_path = .{ .prefixed = .{ .prefix = 0, .sub_path = absolute } },
+                .diagnostic = &path_diagnostic,
+            }) catch |err| {
+                if (err == error.FileSystemFailure) {
+                    if (diagnostic) |d| d.* = .{ .add_discovered_path = path_diagnostic };
+                }
+                return err;
+            };
         }
+    }
+
+    fn validateObservedStat(previous: ?Stat, current: Stat, diagnostic: ?*AddDiscoveredPathDiagnostic) error{FileSystemFailure}!void {
+        const observed = previous orelse return;
+        if (observed.size == current.size and
+            (observed.inode == 0 or observed.inode == current.inode) and
+            (observed.mtime.nanoseconds == 0 or observed.mtime.nanoseconds == current.mtime.nanoseconds)) return;
+        if (diagnostic) |d| d.* = .inconsistent_observations;
+        return error.FileSystemFailure;
     }
 
     fn populateFile(
@@ -1983,6 +2017,7 @@ pub const Manifest = struct {
         handle: Io.File,
         contents: ?[]const u8,
         metadata_only: bool,
+        observed_stat: ?Stat,
         diagnostic: ?*AddDiscoveredPathDiagnostic,
     ) AddDiscoveredPathError!void {
         const io = m.cache.io;
@@ -1995,6 +2030,7 @@ pub const Manifest = struct {
                     return error.FileSystemFailure;
                 },
             };
+            try validateObservedStat(observed_stat, .init(stat), diagnostic);
             try file.setStat(m, .init(stat));
         }
         if (metadata_only) {
@@ -2014,6 +2050,16 @@ pub const Manifest = struct {
                 },
             };
         }
+        if (observed_stat != null) {
+            const stat = handle.stat(io) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| {
+                    if (diagnostic) |d| d.* = .{ .stat_file = e };
+                    return error.FileSystemFailure;
+                },
+            };
+            try validateObservedStat(observed_stat, .init(stat), diagnostic);
+        }
     }
 
     fn populateDirectory(
@@ -2023,6 +2069,7 @@ pub const Manifest = struct {
         handle: Io.Dir,
         contents: ?[]const u8,
         metadata_only: bool,
+        observed_stat: ?Stat,
         diagnostic: ?*AddDiscoveredPathDiagnostic,
     ) AddDiscoveredPathError!void {
         const cache = m.cache;
@@ -2037,6 +2084,7 @@ pub const Manifest = struct {
                     return error.FileSystemFailure;
                 },
             };
+            try validateObservedStat(observed_stat, .init(stat), diagnostic);
             try file.setStat(m, .init(stat));
         }
         if (metadata_only) {
@@ -2057,6 +2105,16 @@ pub const Manifest = struct {
                     return error.FileSystemFailure;
                 },
             };
+        }
+        if (observed_stat != null) {
+            const stat = handle.stat(io) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| {
+                    if (diagnostic) |d| d.* = .{ .stat_dir = e };
+                    return error.FileSystemFailure;
+                },
+            };
+            try validateObservedStat(observed_stat, .init(stat), diagnostic);
         }
     }
 
@@ -3273,4 +3331,135 @@ test "weaker discovered observations preserve content metadata" {
     }));
     try testing.expectEqual(.inconsistent_observations, observation_diag);
     try testing.expectEqualDeep(original, off.get(man.contents.items).*);
+}
+
+test "supplied metadata observations preserve unreliable timestamps" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+    defer testing.allocator.free(cwd);
+    var cache: Cache = .{
+        .io = io,
+        .gpa = testing.allocator,
+        .manifest_dir = try tmp.dir.createDirPathOpen(io, "manifest", .{}),
+        .cwd = cwd,
+    };
+    cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+    defer cache.manifest_dir.close(io);
+    var man = cache.obtain();
+    defer man.deinit();
+    var diag: Manifest.CheckDiagnostic = undefined;
+    try testing.expectEqual(.incomplete_manifest, try man.check(&diag, .none));
+    // Force the content-cache policy to treat this timestamp as unreliable.
+    man.want_refresh_timestamp = false;
+    const observed: Manifest.Stat = .{ .size = 16, .inode = 42, .mtime = .fromNanoseconds(1234567890000000000) };
+    try testing.expect(try man.isProblematicTimestamp(observed.mtime));
+    try man.addDiscoveredPath(.{
+        .discovered_path = .{ .prefixed = .{ .prefix = 0, .sub_path = "/observed/header.h" } },
+        .metadata_only = true,
+        .stat = observed,
+    });
+    const entry = man.files.keys()[0].get(man.contents.items);
+    try testing.expectEqualDeep(observed, entry.stat());
+
+    // A presence query must still ignore the supplied content metadata.
+    try man.addDiscoveredPath(.{
+        .discovered_path = .{ .prefixed = .{ .prefix = 0, .sub_path = "/observed/query.h" } },
+        .metadata_only = true,
+        .existence_only = true,
+        .stat = observed,
+    });
+    const query_off = man.files.keys()[1];
+    const query_digest = query_off.get(man.contents.items).digest;
+    try man.addDiscoveredPath(.{
+        .discovered_path = .{ .prefixed = .{ .prefix = 0, .sub_path = "/observed/query.h" } },
+        .metadata_only = true,
+        .existence_only = true,
+        .stat = .{ .size = 32, .inode = 43, .mtime = .fromNanoseconds(1234567891000000000) },
+    });
+    try testing.expectEqualSlices(u8, &query_digest, &query_off.get(man.contents.items).digest);
+}
+
+fn testDepfileObservationPromotion(change: enum { unchanged, same_size, size, deleted }, supplied: bool) !void {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+    defer testing.allocator.free(tmp_path);
+    const directory: Directory = .{ .path = tmp_path, .handle = tmp.dir };
+    var cache: Cache = .{
+        .io = io,
+        .gpa = testing.allocator,
+        .manifest_dir = try tmp.dir.createDirPathOpen(io, "manifest", .{}),
+        .cwd = tmp_path,
+    };
+    cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+    defer cache.manifest_dir.close(io);
+    const header_path = try std.fs.path.join(testing.allocator, &.{ tmp_path, "value.h" });
+    defer testing.allocator.free(header_path);
+    try tmp.dir.writeFile(io, .{ .sub_path = "value.h", .data = "#define VALUE 11\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "object.d", .data = "object.o: value.h\n" });
+    const file = try tmp.dir.openFile(io, "value.h", .{ .mode = .read_write });
+    defer file.close(io);
+    try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(1234567890000000000) } });
+    const observed = Manifest.Stat.init(try file.stat(io));
+    var man = cache.obtain();
+    defer man.deinit();
+    var diag: Manifest.CheckDiagnostic = undefined;
+    try testing.expectEqual(.incomplete_manifest, try man.check(&diag, .none));
+    man.want_refresh_timestamp = false;
+    try man.addDiscoveredPath(.{
+        .discovered_path = .{ .prefixed = .{ .prefix = 0, .sub_path = header_path } },
+        .metadata_only = true,
+        .stat = observed,
+    });
+    const off = man.files.keys()[0];
+    const snapshot = off.get(man.contents.items).*;
+    switch (change) {
+        .unchanged => {},
+        .same_size, .size => {
+            try tmp.dir.writeFile(io, .{ .sub_path = "value.h", .data = if (change == .same_size) "#define VALUE 23\n" else "#define VALUE 230\n" });
+            try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(1234567891000000000) } });
+        },
+        .deleted => try tmp.dir.deleteFile(io, "value.h"),
+    }
+    if (change == .unchanged) {
+        try man.addDiscoveredDepFile(.{ .root_dir = directory, .sub_path = "object.d" }, null);
+        const entry = off.get(man.contents.items);
+        try testing.expect(!entry.flags.metadata_only);
+        var hasher = hasher_init;
+        hasher.update("#define VALUE 11\n");
+        var expected: BinDigest = undefined;
+        hasher.final(&expected);
+        try testing.expectEqualSlices(u8, &expected, &entry.digest);
+    } else if (supplied) {
+        var path_diag: Manifest.AddDiscoveredPathDiagnostic = .none;
+        try testing.expectError(error.FileSystemFailure, man.addDiscoveredPath(.{
+            .discovered_path = .{ .prefixed = .{ .prefix = 0, .sub_path = header_path } },
+            .stat = Manifest.Stat.init(try file.stat(io)),
+            .contents = if (change == .same_size) "#define VALUE 23\n" else "#define VALUE 230\n",
+            .diagnostic = &path_diag,
+        }));
+        try testing.expectEqual(.inconsistent_observations, path_diag);
+        try testing.expectEqualDeep(snapshot, off.get(man.contents.items).*);
+    } else {
+        var dep_diag: Manifest.AddDiscoveredDepFileDiagnostic = .{ .add_discovered_path = .none };
+        try testing.expectError(error.FileSystemFailure, man.addDiscoveredDepFile(.{ .root_dir = directory, .sub_path = "object.d" }, &dep_diag));
+        if (change == .deleted) {
+            try testing.expectEqual(.open_file, std.meta.activeTag(dep_diag.add_discovered_path));
+        } else {
+            try testing.expectEqual(.inconsistent_observations, dep_diag.add_discovered_path);
+        }
+        try testing.expectEqualDeep(snapshot, off.get(man.contents.items).*);
+    }
+}
+
+test "depfile promotion preserves the observed content snapshot" {
+    try testDepfileObservationPromotion(.unchanged, false);
+    try testDepfileObservationPromotion(.same_size, false);
+    try testDepfileObservationPromotion(.size, false);
+    try testDepfileObservationPromotion(.deleted, false);
+    try testDepfileObservationPromotion(.same_size, true);
+    try testDepfileObservationPromotion(.size, true);
 }
