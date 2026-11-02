@@ -6,6 +6,7 @@ base: link.File,
 
 all_inputs: std.ArrayList(link.Input),
 flushed_once: bool = false,
+has_flush_diagnostics: bool = false,
 parsed_objects: std.ArrayList(?ParsedObject) = .empty,
 
 rpath_list: []const []const u8,
@@ -269,6 +270,7 @@ pub fn deinit(self: *MachO) void {
     const gpa = comp.gpa;
     const io = comp.io;
 
+    for (self.all_inputs.items) |input| gpa.free(input.path().sub_path);
     self.all_inputs.deinit(gpa);
 
     if (self.d_sym) |*d_sym| {
@@ -336,15 +338,43 @@ pub fn deinit(self: *MachO) void {
     self.thunks.deinit(gpa);
 }
 
+/// Prepare a retained old-linker update before new prelink work is queued.
+pub fn beginUpdate(self: *MachO) void {
+    if (self.has_flush_diagnostics) {
+        // A failed flush is retried from fresh link state. Initial prelink
+        // diagnostics are deliberately retained until their inputs are retried.
+        const comp = self.base.comp;
+        comp.link_diags.deinit();
+        comp.link_diags = .init(comp.gpa, comp.io);
+        self.has_flush_diagnostics = false;
+    }
+    self.base.post_prelink = false;
+}
+
 pub fn loadInput(self: *MachO, input: link.Input) link.Error!void {
     const gpa = self.base.comp.gpa;
+    // CObject.clearStatus frees the previous cached path before sending its
+    // replacement. Keep our own path and match C objects by stable source identity.
+    const sub_path = try gpa.dupe(u8, input.path().sub_path);
+    errdefer gpa.free(sub_path);
+    var owned = input;
+    switch (owned) {
+        inline else => |*payload| payload.path.sub_path = sub_path,
+    }
+    const identity = if (input == .object) input.object.c_object else null;
     for (self.all_inputs.items) |*existing| {
-        if (existing.path().eql(input.path())) {
-            existing.* = input;
+        const existing_identity = if (existing.* == .object) existing.object.c_object else null;
+        const replace = if (identity != null)
+            existing_identity == identity
+        else
+            existing_identity == null and existing.path().eql(input.path());
+        if (replace) {
+            gpa.free(existing.path().sub_path);
+            existing.* = owned;
             return;
         }
     }
-    try self.all_inputs.append(gpa, input);
+    try self.all_inputs.append(gpa, owned);
 }
 
 fn resetFlushState(self: *MachO) void {
@@ -438,6 +468,8 @@ pub fn flush(
     const gpa = comp.gpa;
     const io = comp.io;
     const diags = &comp.link_diags;
+
+    defer self.has_flush_diagnostics = diags.hasErrors();
 
     const sub_prog_node = prog_node.start("MachO Flush", 0);
     defer sub_prog_node.end();

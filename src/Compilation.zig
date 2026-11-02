@@ -2921,6 +2921,12 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
     // these inputs to make it past AstGen, and once there, we can rely on
     // learning file system inputs from the Cache object.
 
+    // The old Mach-O linker rebuilds transient link state on flush, so it can
+    // accept a replacement C object before each incremental update.
+    if (comp.config.incremental) if (comp.bin_file) |file| {
+        if (file.cast(.macho)) |macho| macho.beginUpdate();
+    };
+
     // For compiling C objects, we rely on the cache hash system to avoid duplicating work.
     // Add a Job for each C object.
     if (comp.bin_file != null and comp.bin_file.?.post_prelink) {
@@ -5954,7 +5960,7 @@ fn updateCObject(
         },
     };
 
-    try comp.queuePrelinkTasks(&.{.{ .load_object = c_object.status.success.object_path }});
+    try comp.queuePrelinkTasks(&.{.{ .load_c_object = c_object }});
 }
 
 fn updateWin32Resource(comp: *Compilation, win32_resource: *Win32Resource, win32_resource_prog_node: std.Progress.Node) !void {

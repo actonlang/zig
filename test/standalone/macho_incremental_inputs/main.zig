@@ -39,6 +39,43 @@ pub fn main(init: std.process.Init) !void {
     }
     try client.serveBodylessMessage(.exit);
     if (!(try child.wait(io)).success()) return error.CompilerFailed;
+    try testCInputs(arena, io, zig, zig_lib, root);
+}
+
+fn testCInputs(arena: std.mem.Allocator, io: Io, zig: []const u8, zig_lib: []const u8, parent: []const u8) !void {
+    const root = try std.fs.path.join(arena, &.{ parent, "c-inputs" });
+    const dir = try Io.Dir.cwd().createDirPathOpen(io, root, .{});
+    defer dir.close(io);
+    try dir.writeFile(io, .{ .sub_path = "support.c", .data = "#include \"value.h\"\nextern int value(void); int main(void) { return value() + OFFSET; }\n" });
+    try dir.writeFile(io, .{ .sub_path = "value.h", .data = "#define OFFSET 0\n" });
+    try dir.writeFile(io, .{ .sub_path = "value.zig", .data = "pub extern fn main() callconv(.c) c_int; export fn value() callconv(.c) c_int { return 42; }\n" });
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ zig, "build-exe", "value.zig", "support.c", "-lc", "-fno-sanitize-c", "-fno-llvm", "-fno-new-linker", "-fno-compiler-rt", "-fincremental", "--zig-lib-dir", zig_lib, "--cache-dir", "cache", "--global-cache-dir", "global", "--name", "value", "--listen=-" },
+        .cwd = .{ .path = root },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .inherit,
+    });
+    defer child.kill(io);
+    var read_buffer: [4096]u8 = undefined;
+    var write_buffer: [64]u8 = undefined;
+    var reader = child.stdout.?.readerStreaming(io, &read_buffer);
+    var writer = child.stdin.?.writerStreaming(io, &write_buffer);
+    const client: std.zig.Client = .{ .in = &reader.interface, .out = &writer.interface };
+    for ([_]u8{ 0, 1, 9, 2 }) |offset| {
+        try dir.writeFile(io, .{ .sub_path = "value.h", .data = try std.fmt.allocPrint(arena, "#define OFFSET {d}\n", .{offset}) });
+        const digest = try update(arena, client);
+        const executable = try std.fs.path.join(arena, &.{ root, "cache", "o", &std.Build.Cache.binToHex(digest), "value" });
+        try run(arena, io, &.{executable}, root, 42 + offset);
+    }
+    try dir.writeFile(io, .{ .sub_path = "value.h", .data = "#error deliberate failure\n" });
+    try std.testing.expectError(error.CompilationFailed, update(arena, client));
+    try dir.writeFile(io, .{ .sub_path = "value.h", .data = "#define OFFSET 3\n" });
+    const digest = try update(arena, client);
+    const executable = try std.fs.path.join(arena, &.{ root, "cache", "o", &std.Build.Cache.binToHex(digest), "value" });
+    try run(arena, io, &.{executable}, root, 45);
+    try client.serveBodylessMessage(.exit);
+    if (!(try child.wait(io)).success()) return error.CompilerFailed;
 }
 
 fn update(arena: std.mem.Allocator, client: std.zig.Client) !std.Build.Cache.BinDigest {
