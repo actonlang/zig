@@ -39,18 +39,20 @@ pub fn main(init: std.process.Init) !void {
     }
     try client.serveBodylessMessage(.exit);
     if (!(try child.wait(io)).success()) return error.CompilerFailed;
-    try testCInputs(arena, io, zig, zig_lib, root);
+    try testCInputs(arena, io, zig, zig_lib, root, false);
+    try testCInputs(arena, io, zig, zig_lib, root, true);
 }
 
-fn testCInputs(arena: std.mem.Allocator, io: Io, zig: []const u8, zig_lib: []const u8, parent: []const u8) !void {
-    const root = try std.fs.path.join(arena, &.{ parent, "c-inputs" });
+fn testCInputs(arena: std.mem.Allocator, io: Io, zig: []const u8, zig_lib: []const u8, parent: []const u8, single_worker: bool) !void {
+    const root = try std.fs.path.join(arena, &.{ parent, if (single_worker) "c-inputs-single-worker" else "c-inputs" });
     const dir = try Io.Dir.cwd().createDirPathOpen(io, root, .{});
     defer dir.close(io);
     try dir.writeFile(io, .{ .sub_path = "support.c", .data = "#include \"value.h\"\nextern int value(void); int main(void) { return value() + OFFSET; }\n" });
     try dir.writeFile(io, .{ .sub_path = "value.h", .data = "#define OFFSET 0\n" });
+    try dir.writeFile(io, .{ .sub_path = "same.c", .data = "#include \"value.h\"\nstatic int duplicate = OFFSET;\n" });
     try dir.writeFile(io, .{ .sub_path = "value.zig", .data = "pub extern fn main() callconv(.c) c_int; export fn value() callconv(.c) c_int { return 42; }\n" });
     var child = try std.process.spawn(io, .{
-        .argv = &.{ zig, "build-exe", "value.zig", "support.c", "-lc", "-fno-sanitize-c", "-fno-llvm", "-fno-new-linker", "-fno-compiler-rt", "-fincremental", "--zig-lib-dir", zig_lib, "--cache-dir", "cache", "--global-cache-dir", "global", "--name", "value", "--listen=-" },
+        .argv = &.{ zig, "build-exe", "value.zig", "support.c", "same.c", "same.c", if (single_worker) "-j1" else "-j2", "-lc", "-fno-sanitize-c", "-fno-llvm", "-fno-new-linker", "-fno-compiler-rt", "-fincremental", "--zig-lib-dir", zig_lib, "--cache-dir", "cache", "--global-cache-dir", "global", "--name", "value", "--listen=-" },
         .cwd = .{ .path = root },
         .stdin = .pipe,
         .stdout = .pipe,

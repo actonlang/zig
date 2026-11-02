@@ -2938,7 +2938,16 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
         // updates if we've done prelink already. https://codeberg.org/ziglang/zig/issues/32081
     } else {
         try comp.c_object_work_queue.ensureUnusedCapacity(gpa, comp.c_objects.items.len);
+        // Release every prior manifest lock before a worker can run. With
+        // duplicate C inputs, a worker may need an exclusive lock still held
+        // by another input; the async scheduler can execute workers inline.
         for (comp.c_objects.items) |c_object| {
+            if (c_object.clearStatus(gpa, io)) {
+                // OOM failures do not have a diagnostic entry.
+                comp.mutex.lockUncancelable(io);
+                defer comp.mutex.unlock(io);
+                _ = comp.failed_c_objects.swapRemove(c_object);
+            }
             comp.c_object_work_queue.pushBackAssumeCapacity(c_object);
             try comp.appendFileSystemInput(try .fromUnresolved(arena, comp.dirs, &.{c_object.src.src_path}));
         }
@@ -5537,15 +5546,6 @@ fn updateCObject(
 
     const gpa = comp.gpa;
     const io = comp.io;
-
-    if (c_object.clearStatus(gpa, io)) {
-        // There was previous failure.
-        comp.mutex.lockUncancelable(io);
-        defer comp.mutex.unlock(io);
-        // If the failure was OOM, there will not be an entry here, so we do
-        // not assert discard.
-        _ = comp.failed_c_objects.swapRemove(c_object);
-    }
 
     var man = comp.obtainCObjectCacheManifest(c_object.src.owner);
     defer man.deinit();
