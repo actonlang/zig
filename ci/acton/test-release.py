@@ -435,7 +435,11 @@ def source_checks(runner, zig, source, work, mac_arm):
         "--test-filter", "Build.Cache"], work)
     require("depfile promotion preserves the observed content snapshot" in output,
             "release library did not run the required cache regression")
-    fixtures = ["c_include_cache", "c_runtime_rebuild"] + (["macho_incremental_inputs"] if mac_arm else [])
+    fixtures = ["c_include_cache", "c_runtime_rebuild"]
+    if mac_arm:
+        fixtures += ["macho_incremental_inputs"]
+    if platform.machine().lower() in {"aarch64", "arm64"}:
+        fixtures += ["aarch64_slice_field", "aarch64_padded_aggregate"]
     for fixture in fixtures:
         original = source / "test/standalone" / fixture
         require((original / "build.zig").is_file(), "missing source regression: " + fixture)
@@ -445,13 +449,14 @@ def source_checks(runner, zig, source, work, mac_arm):
     if mac_arm:
         abi = work / "c-abi"
         abi.mkdir()
-        for name in ("main.zig", "cfuncs.c"):
+        for name in ("regressions.zig", "regressions.c", "assert_or_panic.h", "regressions_runner.zig"):
             shutil.copy2(source / "test/c_abi" / name, abi / name)
         filters = ("conditional early return through C", "external global offsets through C",
                    "indirect result pointer under register pressure")
         for backend in ("llvm", "no-llvm"):
-            command = [zig, "test", abi / "main.zig", abi / "cfuncs.c", "-lc",
-                       "-f" + backend, "-fno-new-linker", "-Odebug"]
+            command = [zig, "test", abi / "regressions.zig", abi / "regressions.c", "-lc",
+                       "--test-runner", abi / "regressions_runner.zig",
+                       "-f" + backend, "-fno-new-linker", "-Odebug", "-j2"]
             for name in filters:
                 command += ["--test-filter", name]
             output = runner.run("c-abi-" + backend, command, abi)

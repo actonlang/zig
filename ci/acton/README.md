@@ -35,6 +35,17 @@ their compiler only with the native backend and old Mach-O linker, which can
 refresh C inputs. Other C-bearing steps use a fresh compiler for each request.
 This avoids stale C output on linkers that do not implement those updates.
 
+The AArch64 macOS ABI checks reuse the three cases in
+`test/c_abi/regressions.zig` and their C helpers. The normal C ABI suite imports
+these same cases. Release checks use a small C-entry test runner because the
+broader native test harness and unrelated exported ABI functions still cause
+excessive compiler memory use on this revision. The focused checks run all
+three unchanged test bodies with both LLVM and the native backend; they do
+not claim that the full native C ABI suite passes. Forwarding an over-aligned
+one-field struct by value to C also still crashes the native compiler. The
+`aarch64_padded_aggregate` fixture covers copying these values through pointers,
+which is the repaired case.
+
 To prepare a release:
 
 1. Fetch upstream and rebase the compiler fixes. Keep independent fixes in
