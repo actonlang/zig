@@ -26,7 +26,9 @@ jobs. The macOS runners only execute package tests; their smaller memory does
 not limit compiler construction. The missing Intel macOS LLVM kit is built
 from the pinned upstream bootstrap sources and cached by inputs and recipe.
 Changing either invalidates the cache. Initial LLVM builds can take hours;
-subsequent compiler releases reuse the kit.
+subsequent compiler releases reuse the kit. New source revisions keep an
+in-progress dependency build running; kit jobs serialize and restore its cache
+once it finishes.
 
 To prepare a release:
 

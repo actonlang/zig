@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.ref }}-${{ github.sha }}
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
@@ -56,6 +56,9 @@ jobs:
           retention-days: 7
 
   llvm-intel-macos:
+    concurrency:
+      group: intel-macos-llvm-${{ github.ref }}
+      cancel-in-progress: false
     runs-on: ubuntu-24.04
     timeout-minutes: 350
     steps:
