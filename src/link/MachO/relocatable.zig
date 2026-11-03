@@ -517,6 +517,7 @@ fn sanitizeZigSections(macho_file: *MachO) void {
 fn createSegment(macho_file: *MachO) !void {
     const gpa = macho_file.base.comp.gpa;
 
+    macho_file.segments.clearRetainingCapacity();
     // For relocatable, we only ever need a single segment so create it now.
     const prot: macho.vm_prot_t = .{ .READ = true, .WRITE = true, .EXEC = true };
     try macho_file.segments.append(gpa, .{

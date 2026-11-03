@@ -501,6 +501,7 @@ pub fn calcSymtabSize(self: *ZigObject, macho_file: *MachO) void {
     defer tracy.end();
 
     for (self.symbols.items, 0..) |*sym, i| {
+        if (self.symtab.items(.nlist)[i].n_strx == 0) continue;
         const ref = self.getSymbolRef(@intCast(i), macho_file);
         const file = ref.getFile(macho_file) orelse continue;
         if (file.getIndex() != self.index) continue;
@@ -1235,6 +1236,10 @@ pub fn updateExports(
             //     sym.* = .{};
             // }
             nlist.* = MachO.null_sym;
+            self.globals.items[nlist_index] = 0;
+            self.symbols.items[nlist_index].flags = .{};
+            self.symbols.items[nlist_index].visibility = .local;
+            self.symbols.items[nlist_index].atom_ref = .{ .index = 0, .file = 0 };
         }
         metadata.exports.clearRetainingCapacity();
     }
@@ -1250,6 +1255,10 @@ pub fn updateExports(
             //     sym.* = .{};
             // }
             nlist.* = MachO.null_sym;
+            self.globals.items[nlist_index] = 0;
+            self.symbols.items[nlist_index].flags = .{};
+            self.symbols.items[nlist_index].visibility = .local;
+            self.symbols.items[nlist_index].atom_ref = .{ .index = 0, .file = 0 };
         }
         metadata.exports.clearRetainingCapacity();
     }
