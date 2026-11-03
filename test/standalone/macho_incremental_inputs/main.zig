@@ -38,7 +38,7 @@ pub fn main(init: std.process.Init) !void {
         try run(arena, io, &.{executable}, root, expected);
     }
     try client.serveBodylessMessage(.exit);
-    if (!(try child.wait(io)).success()) return error.CompilerFailed;
+    if (!(try child.wait(io)).eql(.success)) return error.CompilerFailed;
     try testCInputs(arena, io, zig, zig_lib, root, false);
     try testCInputs(arena, io, zig, zig_lib, root, true);
 }
@@ -77,7 +77,7 @@ fn testCInputs(arena: std.mem.Allocator, io: Io, zig: []const u8, zig_lib: []con
     const executable = try std.fs.path.join(arena, &.{ root, "cache", "o", &std.Build.Cache.binToHex(digest), "value" });
     try run(arena, io, &.{executable}, root, 45);
     try client.serveBodylessMessage(.exit);
-    if (!(try child.wait(io)).success()) return error.CompilerFailed;
+    if (!(try child.wait(io)).eql(.success)) return error.CompilerFailed;
 }
 
 fn update(arena: std.mem.Allocator, client: std.zig.Client) !std.Build.Cache.BinDigest {

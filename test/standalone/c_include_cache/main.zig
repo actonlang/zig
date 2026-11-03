@@ -192,7 +192,7 @@ fn compileAndRun(arena: std.mem.Allocator, io: Io, command: []const []const u8, 
         }
     }
     try client.serveBodylessMessage(.exit);
-    if (!(try child.wait(io)).success()) return error.CompilerFailed;
+    if (!(try child.wait(io)).eql(.success)) return error.CompilerFailed;
     const hex = std.Build.Cache.binToHex(digest orelse return error.NoArtifact);
     const executable = try std.fs.path.join(arena, &.{ root, "cache", "o", &hex, output_name });
     try run(arena, io, &.{executable}, root, expected, try std.fmt.allocPrint(arena, "{s}/{s}", .{ @tagName(mode), @tagName(case) }));
