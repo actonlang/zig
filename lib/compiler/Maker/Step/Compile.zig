@@ -45,6 +45,27 @@ pub fn make(
 
     try lowerZigArgs(arena, compile_index, maker, progress_node, &argv, false);
 
+    const native_bsp = maker.protocol_server != null and try maker.hasNativeInputs(arena, compile_index);
+    if (native_bsp) {
+        // Keep C-bearing LLVM and non-executable steps on fresh compiler processes.
+        // Incremental mode validates their C inputs without retaining linker state.
+        var have_incremental = false;
+        var have_linker = false;
+        const macos = conf_comp.rootModuleTarget(conf).flags.os_tag == .macos;
+        for (argv.items) |*arg| {
+            if (mem.eql(u8, arg.*, "-fincremental") or mem.eql(u8, arg.*, "-fno-incremental")) {
+                arg.* = "-fincremental";
+                have_incremental = true;
+            }
+            if (macos and (mem.eql(u8, arg.*, "-fnew-linker") or mem.eql(u8, arg.*, "-fno-new-linker"))) {
+                arg.* = "-fno-new-linker";
+                have_linker = true;
+            }
+        }
+        if (!have_incremental) try argv.append(gpa, "-fincremental");
+        if (macos and !have_linker) try argv.append(gpa, "-fno-new-linker");
+    }
+
     const incremental = conf_comp.flags4.incremental.toBool() orelse graph.incremental orelse false;
 
     const opt_cache_digest = Step.evalZigProcess(
@@ -52,7 +73,10 @@ pub fn make(
         maker,
         argv.items,
         progress_node,
-        incremental and (maker.watch or maker.web_server != null),
+        !native_bsp and incremental and (maker.watch or maker.web_server != null or
+            (maker.protocol_server != null and
+                ((conf_comp.flags2.use_llvm == .false and conf_comp.flags3.kind == .exe) or
+                    (conf_comp.generated_bin.value == null and conf_comp.generated_llvm_bc.value != null)))),
     ) catch |err| switch (err) {
         error.NeedCompileErrorCheck => {
             try checkCompileErrors(arena, maker, compile_index);
