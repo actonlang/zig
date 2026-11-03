@@ -117,7 +117,8 @@ link_queue: link.Queue = .empty,
 oneshot_prelink_tasks: std.ArrayList(link.PrelinkTask),
 
 /// Set of work that can be represented by only flags to determine whether the
-/// work is queued or not.
+/// work is queued or not. Non-incremental compilations keep completed jobs queued
+/// so that each fresh linker receives its runtime inputs.
 queued_jobs: QueuedJobs,
 
 /// These jobs are to invoke the Clang compiler to create an object file, which
@@ -2660,6 +2661,9 @@ fn reset(comp: *Compilation, arena: std.mem.Allocator) Allocator.Error!void {
         if (zcu.generation > 0) return;
         try zcu.reset(arena);
     }
+    // A retained linker owns these inputs even when there is no Zig module.
+    // Preserve their paths and cache locks until the compilation is destroyed.
+    if (comp.config.incremental) return;
 
     comp.windows_libs_num_done = 0;
 
@@ -5310,7 +5314,7 @@ fn buildRt(
 
 fn buildMuslCrtFile(comp: *Compilation, crt_file: musl.CrtFile, prog_node: std.Progress.Node) void {
     if (musl.buildCrtFile(comp, crt_file, prog_node)) |_| {
-        comp.queued_jobs.musl_crt_file[@backingInt(crt_file)] = false;
+        if (comp.config.incremental) comp.queued_jobs.musl_crt_file[@backingInt(crt_file)] = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.musl_crt_file, "unable to build musl {s}: {s}", .{
@@ -5321,7 +5325,7 @@ fn buildMuslCrtFile(comp: *Compilation, crt_file: musl.CrtFile, prog_node: std.P
 
 fn buildGlibcCrtFile(comp: *Compilation, crt_file: glibc.CrtFile, prog_node: std.Progress.Node) void {
     if (glibc.buildCrtFile(comp, crt_file, prog_node)) |_| {
-        comp.queued_jobs.glibc_crt_file[@backingInt(crt_file)] = false;
+        if (comp.config.incremental) comp.queued_jobs.glibc_crt_file[@backingInt(crt_file)] = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.glibc_crt_file, "unable to build glibc {s}: {s}", .{
@@ -5332,8 +5336,7 @@ fn buildGlibcCrtFile(comp: *Compilation, crt_file: glibc.CrtFile, prog_node: std
 
 fn buildGlibcSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) void {
     if (glibc.buildSharedObjects(comp, prog_node)) |_| {
-        // The job should no longer be queued up since it succeeded.
-        comp.queued_jobs.glibc_shared_objects = false;
+        if (comp.config.incremental) comp.queued_jobs.glibc_shared_objects = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.glibc_shared_objects, "unable to build glibc shared objects: {t}", .{err}),
@@ -5342,7 +5345,7 @@ fn buildGlibcSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) voi
 
 fn buildFreeBSDCrtFile(comp: *Compilation, crt_file: freebsd.CrtFile, prog_node: std.Progress.Node) void {
     if (freebsd.buildCrtFile(comp, crt_file, prog_node)) |_| {
-        comp.queued_jobs.freebsd_crt_file[@backingInt(crt_file)] = false;
+        if (comp.config.incremental) comp.queued_jobs.freebsd_crt_file[@backingInt(crt_file)] = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.freebsd_crt_file, "unable to build FreeBSD {s}: {s}", .{
@@ -5353,8 +5356,7 @@ fn buildFreeBSDCrtFile(comp: *Compilation, crt_file: freebsd.CrtFile, prog_node:
 
 fn buildFreeBSDSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) void {
     if (freebsd.buildSharedObjects(comp, prog_node)) |_| {
-        // The job should no longer be queued up since it succeeded.
-        comp.queued_jobs.freebsd_shared_objects = false;
+        if (comp.config.incremental) comp.queued_jobs.freebsd_shared_objects = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.freebsd_shared_objects, "unable to build FreeBSD libc shared objects: {s}", .{
@@ -5365,7 +5367,7 @@ fn buildFreeBSDSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) v
 
 fn buildNetBSDCrtFile(comp: *Compilation, crt_file: netbsd.CrtFile, prog_node: std.Progress.Node) void {
     if (netbsd.buildCrtFile(comp, crt_file, prog_node)) |_| {
-        comp.queued_jobs.netbsd_crt_file[@backingInt(crt_file)] = false;
+        if (comp.config.incremental) comp.queued_jobs.netbsd_crt_file[@backingInt(crt_file)] = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.netbsd_crt_file, "unable to build NetBSD {s}: {s}", .{
@@ -5376,8 +5378,7 @@ fn buildNetBSDCrtFile(comp: *Compilation, crt_file: netbsd.CrtFile, prog_node: s
 
 fn buildNetBSDSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) void {
     if (netbsd.buildSharedObjects(comp, prog_node)) |_| {
-        // The job should no longer be queued up since it succeeded.
-        comp.queued_jobs.netbsd_shared_objects = false;
+        if (comp.config.incremental) comp.queued_jobs.netbsd_shared_objects = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.netbsd_shared_objects, "unable to build NetBSD libc shared objects: {s}", .{
@@ -5388,7 +5389,7 @@ fn buildNetBSDSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) vo
 
 fn buildOpenBSDCrtFile(comp: *Compilation, crt_file: openbsd.CrtFile, prog_node: std.Progress.Node) void {
     if (openbsd.buildCrtFile(comp, crt_file, prog_node)) |_| {
-        comp.queued_jobs.openbsd_crt_file[@backingInt(crt_file)] = false;
+        if (comp.config.incremental) comp.queued_jobs.openbsd_crt_file[@backingInt(crt_file)] = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.openbsd_crt_file, "unable to build OpenBSD {s}: {s}", .{
@@ -5399,8 +5400,7 @@ fn buildOpenBSDCrtFile(comp: *Compilation, crt_file: openbsd.CrtFile, prog_node:
 
 fn buildOpenBSDSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) void {
     if (openbsd.buildSharedObjects(comp, prog_node)) |_| {
-        // The job should no longer be queued up since it succeeded.
-        comp.queued_jobs.openbsd_shared_objects = false;
+        if (comp.config.incremental) comp.queued_jobs.openbsd_shared_objects = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.openbsd_shared_objects, "unable to build OpenBSD libc shared objects: {s}", .{
@@ -5411,7 +5411,7 @@ fn buildOpenBSDSharedObjects(comp: *Compilation, prog_node: std.Progress.Node) v
 
 fn buildMingwCrtFile(comp: *Compilation, crt_file: mingw.CrtFile, prog_node: std.Progress.Node) void {
     if (mingw.buildCrtFile(comp, crt_file, prog_node)) |_| {
-        comp.queued_jobs.mingw_crt_file[@backingInt(crt_file)] = false;
+        if (comp.config.incremental) comp.queued_jobs.mingw_crt_file[@backingInt(crt_file)] = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.mingw_crt_file, "unable to build mingw-w64 {s}: {s}", .{
@@ -5456,7 +5456,7 @@ fn buildMingwImportLib(comp: *Compilation, lib_name: []const u8, is_prelink: boo
 
 fn buildLibUnwind(comp: *Compilation, prog_node: std.Progress.Node) void {
     if (libunwind.buildStaticLib(comp, prog_node)) |_| {
-        comp.queued_jobs.libunwind = false;
+        if (comp.config.incremental) comp.queued_jobs.libunwind = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.libunwind, "unable to build libunwind: {s}", .{@errorName(err)}),
@@ -5465,7 +5465,7 @@ fn buildLibUnwind(comp: *Compilation, prog_node: std.Progress.Node) void {
 
 fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) void {
     if (libcxx.buildLibCxx(comp, prog_node)) |_| {
-        comp.queued_jobs.libcxx = false;
+        if (comp.config.incremental) comp.queued_jobs.libcxx = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.libcxx, "unable to build libcxx: {s}", .{@errorName(err)}),
@@ -5474,7 +5474,7 @@ fn buildLibCxx(comp: *Compilation, prog_node: std.Progress.Node) void {
 
 fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) void {
     if (libcxx.buildLibCxxAbi(comp, prog_node)) |_| {
-        comp.queued_jobs.libcxxabi = false;
+        if (comp.config.incremental) comp.queued_jobs.libcxxabi = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.libcxxabi, "unable to build libcxxabi: {s}", .{@errorName(err)}),
@@ -5483,7 +5483,7 @@ fn buildLibCxxAbi(comp: *Compilation, prog_node: std.Progress.Node) void {
 
 fn buildLibTsan(comp: *Compilation, prog_node: std.Progress.Node) void {
     if (libtsan.buildTsan(comp, prog_node)) |_| {
-        comp.queued_jobs.libtsan = false;
+        if (comp.config.incremental) comp.queued_jobs.libtsan = false;
     } else |err| switch (err) {
         error.AlreadyReported => return,
         else => comp.lockAndSetMiscFailure(.libtsan, "unable to build TSAN library: {s}", .{@errorName(err)}),
