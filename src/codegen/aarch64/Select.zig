@@ -11026,7 +11026,12 @@ pub const Value = struct {
                                         .field => |field| {
                                             var base_ptr = ip.indexToKey(field.base).ptr;
                                             const agg_ty: ZigType = .fromInterned(ip.indexToKey(base_ptr.ty).ptr_type.child);
-                                            base_ptr.byte_offset += agg_ty.structFieldOffset(@intCast(field.index), zcu) + ptr.byte_offset;
+                                            const field_offset: u64 = if (agg_ty.isSlice(zcu)) switch (field.index) {
+                                                Constant.slice_ptr_index => 0,
+                                                Constant.slice_len_index => @divExact(isel.target.ptrBitWidth(), 8),
+                                                else => unreachable,
+                                            } else agg_ty.structFieldOffset(@intCast(field.index), zcu);
+                                            base_ptr.byte_offset += field_offset + ptr.byte_offset;
                                             continue :constant_key .{ .ptr = base_ptr };
                                         },
                                         .comptime_alloc, .comptime_field, .arr_elem => unreachable,
