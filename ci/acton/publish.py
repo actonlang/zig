@@ -31,6 +31,11 @@ identity.write_text(json.dumps({'version': version, 'source_commit': revision,
                                'archives': {p.name: digest(p) for p in archives}}, indent=2) + '\n')
 tag = 'acton-' + version
 repo = 'actonlang/zig'
+branch = 'refs/heads/zig-release'
+current = subprocess.check_output(['git', 'ls-remote', '--exit-code',
+                                   'https://github.com/' + repo + '.git', branch], text=True).split()
+if current != [revision, branch]:
+    raise SystemExit('Release branch advanced; publish from its current revision')
 tag_lookup = subprocess.run(['git', 'ls-remote', '--exit-code', '--tags',
                              'https://github.com/' + repo + '.git', 'refs/tags/' + tag],
                             capture_output=True, text=True)
