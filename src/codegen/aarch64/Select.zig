@@ -8907,7 +8907,8 @@ pub const Value = struct {
         parent_tag: Parent.Tag,
         location_tag: Location.Tag,
         parts_len_minus_one: std.math.IntFittingRange(0, Value.max_parts - 1),
-        unused: u18 = 0,
+        has_parts: bool,
+        unused: u17 = 0,
     };
 
     pub const Parent = union(enum(u3)) {
@@ -9103,11 +9104,12 @@ pub const Value = struct {
         }
 
         fn setParts(vi: Value.Index, isel: *Select, parts_len: Value.PartsLen) void {
-            assert(parts_len > 1);
+            assert(parts_len > 0);
             const value = vi.get(isel);
-            assert(value.flags.parts_len_minus_one == 0);
+            assert(!value.flags.has_parts);
             value.parts = @fromBackingInt(@intCast(isel.values.items.len));
             value.flags.parts_len_minus_one = @intCast(parts_len - 1);
+            value.flags.has_parts = true;
         }
 
         fn addPart(vi: Value.Index, isel: *Select, part_offset: u64, part_size: u64) Value.Index {
@@ -9123,13 +9125,11 @@ pub const Value = struct {
 
         pub fn parts(vi: Value.Index, isel: *Select) Value.PartIterator {
             const value = vi.get(isel);
-            return switch (value.flags.parts_len_minus_one) {
-                0 => .initOne(vi),
-                else => |parts_len_minus_one| .{
-                    .vi = value.parts,
-                    .remaining = @as(Value.PartsLen, parts_len_minus_one) + 1,
-                },
-            };
+            return if (value.flags.has_parts) .{
+                .vi = value.parts,
+                .remaining = @as(Value.PartsLen, value.flags.parts_len_minus_one) + 1,
+                .is_leaf = false,
+            } else .initOne(vi);
         }
 
         fn containingParts(vi: Value.Index, isel: *Select, part_offset: u64, part_size: u64) Value.PartIterator {
@@ -9140,6 +9140,7 @@ pub const Value = struct {
             return .{
                 .vi = start_vi,
                 .remaining = @intCast(@backingInt(end_vi) - @backingInt(start_vi) + 1),
+                .is_leaf = false,
             };
         }
         comptime {
@@ -9150,7 +9151,7 @@ pub const Value = struct {
             const SearchPartIndex = std.math.IntFittingRange(0, Value.max_parts * 2 - 1);
             const value = vi.get(isel);
             var last: SearchPartIndex = value.flags.parts_len_minus_one;
-            if (last == 0) return vi;
+            if (!value.flags.has_parts) return vi;
             var first: SearchPartIndex = 0;
             last += 1;
             while (true) {
@@ -10144,9 +10145,10 @@ pub const Value = struct {
     pub const PartIterator = struct {
         vi: Value.Index,
         remaining: Value.PartsLen,
+        is_leaf: bool,
 
         fn initOne(vi: Value.Index) PartIterator {
-            return .{ .vi = vi, .remaining = 1 };
+            return .{ .vi = vi, .remaining = 1, .is_leaf = true };
         }
 
         pub fn next(it: *PartIterator) ?Value.Index {
@@ -10161,8 +10163,10 @@ pub const Value = struct {
             return it_mut.next();
         }
 
+        /// A split value can have one child when the rest of its storage is padding.
+        /// Callers must still visit that child instead of treating the parent as a leaf.
         pub fn only(it: PartIterator) ?Value.Index {
-            return if (it.remaining == 1) it.vi else null;
+            return if (it.is_leaf and it.remaining == 1) it.vi else null;
         }
     };
 
@@ -11238,6 +11242,7 @@ fn initValueAdvanced(
             .parent_tag = .unallocated,
             .location_tag = if (size > 16) .large else .small,
             .parts_len_minus_one = 0,
+            .has_parts = false,
         },
         .offset_from_parent = offset_from_parent,
         .parent_payload = .{ .unallocated = {} },
@@ -11371,7 +11376,7 @@ fn dumpValuesInner(isel: *Select, which: WhichValues) !void {
         try stderr.print(" refs={d}\n", .{value.refs});
 
         var part_index = value.flags.parts_len_minus_one;
-        if (part_index > 0) while (true) : (part_index -= 1) {
+        if (value.flags.has_parts) while (true) : (part_index -= 1) {
             roots.putAssumeCapacityNoClobber(
                 @fromBackingInt(@intCast(@backingInt(value.parts) + part_index)),
                 root_entry.value + 1,
