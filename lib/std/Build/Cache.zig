@@ -2952,6 +2952,7 @@ fn testMetadataAbsence(is_directory: bool, blocked_parent: bool, discovered: boo
             if (is_directory) {
                 try tmp.dir.createDir(io, "parent/candidate", .default_dir);
             } else try tmp.dir.writeFile(io, .{ .sub_path = "parent/candidate", .data = "now present" });
+            try testWaitForFileTimestampTick(io, tmp.dir);
         }
         if (phase == 5) {
             if (is_directory) try tmp.dir.deleteDir(io, "parent/candidate") else try tmp.dir.deleteFile(io, "parent/candidate");
@@ -3358,6 +3359,54 @@ test "weaker discovered observations preserve content metadata" {
     }));
     try testing.expectEqual(.inconsistent_observations, observation_diag);
     try testing.expectEqualDeep(original, off.get(man.contents.items).*);
+}
+
+test "queried metadata with unreliable timestamps is rechecked" {
+    const io = testing.io;
+    for ([_]bool{ false, true }) |is_directory| {
+        var tmp = testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const cwd = try std.process.currentPathAlloc(io, testing.allocator);
+        defer testing.allocator.free(cwd);
+        const tmp_path = try tmp.dir.realPathFileAlloc(io, ".", testing.allocator);
+        defer testing.allocator.free(tmp_path);
+        const directory: Directory = .{ .path = tmp_path, .handle = tmp.dir };
+        var cache: Cache = .{
+            .io = io,
+            .gpa = testing.allocator,
+            .manifest_dir = try tmp.dir.createDirPathOpen(io, "manifest", .{}),
+            .cwd = cwd,
+        };
+        cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
+        cache.addPrefix(directory);
+        defer cache.manifest_dir.close(io);
+        if (is_directory) {
+            try tmp.dir.createDir(io, "candidate", .default_dir);
+        } else try tmp.dir.writeFile(io, .{ .sub_path = "candidate", .data = "metadata only" });
+        const observed = Manifest.Stat.init(try tmp.dir.statFile(io, "candidate", .{}));
+        for (0..2) |phase| {
+            var man = cache.obtain();
+            defer man.deinit();
+            var diag: Manifest.CheckDiagnostic = undefined;
+            const result = try man.check(&diag, .none);
+            if (phase == 1) {
+                try testing.expectEqual(.metadata_changed, std.meta.activeTag(result));
+                continue;
+            }
+            try testing.expectEqual(.incomplete_manifest, result);
+            // Force the content-cache policy to reject this timestamp without
+            // depending on the filesystem's timestamp resolution.
+            man.want_refresh_timestamp = false;
+            try testing.expect(try man.isProblematicTimestamp(observed.mtime));
+            try man.addDiscoveredPath(.{
+                .discovered_path = .{ .unresolved = .{ .root_dir = directory, .sub_path = "candidate" } },
+                .handle = if (is_directory) .{ .dir = null } else .{ .file = null },
+                .metadata_only = true,
+            });
+            _ = man.missDigest();
+            try man.finalize();
+        }
+    }
 }
 
 test "supplied metadata observations preserve unreliable timestamps" {
