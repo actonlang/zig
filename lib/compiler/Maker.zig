@@ -266,9 +266,13 @@ fn prepareRebuild(maker: *Maker) !void {
 pub fn hasNativeInputs(maker: *Maker, arena: Allocator, index: Configuration.Step.Index) !bool {
     const conf = &maker.scanned_config.configuration;
     const compile = index.ptr(conf).extended.get(conf.extra).compile;
-    // Only final native executables retain C-bearing compiler processes.
-    if (compile.flags2.use_llvm == .false and compile.flags3.kind == .exe)
-        return hasUntrackedNativeInputs(maker, arena, index, false);
+    // Only the old Mach-O linker refreshes C objects after prelink. Other
+    // linkers skip C updates in a retained compiler, including ELF executables.
+    // An unspecified Mach-O linker selects the new linker in incremental mode.
+    const refreshes_c_inputs = compile.flags2.use_llvm == .false and compile.flags3.kind == .exe and
+        compile.rootModuleTarget(conf).flags.object_format.unwrap() == .macho and
+        compile.flags2.use_lld != .true and compile.flags2.use_new_linker == .false;
+    if (refreshes_c_inputs) return hasUntrackedNativeInputs(maker, arena, index, false);
     return hasUntrackedNativeInputs(maker, arena, index, true);
 }
 

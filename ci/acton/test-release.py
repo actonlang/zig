@@ -256,11 +256,13 @@ def runtime_checks(runner, zig, work, target):
 BSP_BUILD = '''const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
+    const native = b.option(bool, "native", "Exercise native C compiler updates") orelse false;
     const exe = b.addExecutable(.{
         .name = "bsp-probe",
         .root_module = b.createModule(.{ .target = target, .optimize = .debug, .link_libc = true }),
-        .use_llvm = true,
+        .use_llvm = !native,
     });
+    exe.incremental = native;
     if (target.result.os.tag == .macos) exe.use_new_linker = false;
     exe.root_module.addCSourceFile(.{ .file = b.path("main.c"), .flags = &.{} });
     exe.root_module.addIncludePath(b.path("."));
@@ -271,12 +273,13 @@ pub fn build(b: *std.Build) void {
 
 class BuildServer:
     """Minimal client for the pinned Zig build-system protocol, version 1."""
-    def __init__(self, runner, zig, work, target):
-        self.runner, self.work = runner, work
+    def __init__(self, runner, zig, work, target, backend):
+        self.runner, self.work, self.backend = runner, work, backend
         self.step = None
         self.configurations = 0
-        self.log = (runner.output / "bsp-stderr.log").open("wb")
-        command = [str(zig), "build", "--listen=-", "--prefix", str(work / "out"), "-j2"]
+        self.log = (runner.output / ("bsp-" + backend + "-stderr.log")).open("wb")
+        command = [str(zig), "build", "--listen=-", "--prefix", str(work / "out"), "-j2",
+                   "-Dnative=" + ("true" if backend == "native" else "false")]
         if target:
             command.append("-Dtarget=" + target)
         try:
@@ -290,11 +293,11 @@ class BuildServer:
         result = bytearray()
         while len(result) < count:
             seconds = deadline - time.monotonic()
-            require(seconds > 0, "BSP request timed out; see bsp-stderr.log")
+            require(seconds > 0, "BSP request timed out; see " + self.log.name)
             require(bool(select.select([self.process.stdout], [], [], seconds)[0]),
-                    "BSP request timed out; see bsp-stderr.log")
+                    "BSP request timed out; see " + self.log.name)
             data = os.read(self.process.stdout.fileno(), count - len(result))
-            require(bool(data), "BSP closed its protocol stream; see bsp-stderr.log")
+            require(bool(data), "BSP closed its protocol stream; see " + self.log.name)
             result.extend(data)
         return bytes(result)
 
@@ -326,7 +329,7 @@ class BuildServer:
                 require(handshake, "BSP configuration arrived before handshake")
                 self.configure(body)
             elif tag == 0x80000002:
-                raise Failure("BSP initial configuration failed; see bsp-stderr.log")
+                raise Failure("BSP initial configuration failed; see " + self.log.name)
 
     def request(self):
         self.process.stdin.write(struct.pack("<IIIII", 0x80000000, 12, 1, 0, self.step))
@@ -362,9 +365,31 @@ class BuildServer:
             require("RELEASE_VALIDATION_ERROR" in "\n".join(diagnostics), "BSP lost the C diagnostic")
         else:
             require(not failed, "BSP generation failed: " + "\n".join(diagnostics))
-            output = self.runner.run("bsp-" + phase, [self.work / "out/bin/bsp-probe"], self.work, timeout=20)
+            output = self.runner.run("bsp-" + self.backend + "-" + phase,
+                                     [self.work / "out/bin/bsp-probe"], self.work, timeout=20)
             require(output == "bsp=" + str(expected) + "\n", "stale or incorrect BSP executable")
-        return {"phase": phase, "pid": self.process.pid, "expected": expected, "failed": failed}
+        require(self.process.poll() is None, "BSP server exited")
+        return {"phase": phase, "pid": self.process.pid, "expected": expected, "failed": failed,
+                "compiler_pids": self.compiler_pids()}
+
+    def compiler_pids(self):
+        # Observe only this Maker's descendants after completion. Fresh-process
+        # steps have already waited for their compiler; retained steps keep it.
+        output = subprocess.check_output(["ps", "-axww", "-o", "pid=,ppid=,command="], text=True, timeout=20)
+        processes = {}
+        for line in output.splitlines():
+            fields = line.split(None, 2)
+            if len(fields) == 3:
+                processes[int(fields[0])] = (int(fields[1]), fields[2])
+        descendants = {self.process.pid}
+        while True:
+            added = {pid for pid, (parent, _) in processes.items() if parent in descendants} - descendants
+            if not added:
+                break
+            descendants.update(added)
+        return sorted(pid for pid in descendants if pid in processes and
+                      "build-exe " in processes[pid][1] and "--listen=-" in processes[pid][1] and
+                      "bsp-probe" in processes[pid][1])
 
     def close(self):
         try:
@@ -377,21 +402,31 @@ class BuildServer:
 
 def bsp_checks(runner, zig, work, target):
     work.mkdir()
-    (work / "build.zig").write_text(BSP_BUILD)
-    (work / "main.c").write_text('#include <stdio.h>\n#include "value.h"\nint main(void) { printf("bsp=%d\\n", VALUE); return 0; }\n')
-    header = work / "value.h"
-    header.write_text("#define VALUE 41\n")
-    server = BuildServer(runner, zig, work, target)
-    rows = []
-    try:
-        server.start()
-        for phase, value in (("initial", 41), ("updated", 42), ("error", None), ("recovered", 43)):
-            header.write_text("#error RELEASE_VALIDATION_ERROR\n" if value is None else "#define VALUE " + str(value) + "\n")
-            rows.append(server.build(phase, value))
-    finally:
-        server.close()
-    require(len({row["pid"] for row in rows}) == 1, "BSP server restarted")
-    return rows
+    lanes = {}
+    for backend in ("llvm", "native"):
+        lane = work / backend
+        lane.mkdir()
+        (lane / "build.zig").write_text(BSP_BUILD)
+        (lane / "main.c").write_text('#include <stdio.h>\n#include "value.h"\nint main(void) { printf("bsp=%d\\n", VALUE); return 0; }\n')
+        header = lane / "value.h"
+        header.write_text("#define VALUE 41\n")
+        server = BuildServer(runner, zig, lane, target, backend)
+        rows = []
+        lanes[backend] = rows
+        try:
+            server.start()
+            for phase, value in (("initial", 41), ("updated", 42), ("error", None), ("recovered", 43)):
+                header.write_text("#error RELEASE_VALIDATION_ERROR\n" if value is None else "#define VALUE " + str(value) + "\n")
+                rows.append(server.build(phase, value))
+        finally:
+            server.close()
+        require(len({row["pid"] for row in rows}) == 1, "BSP server restarted")
+        if backend == "native" and sys.platform == "darwin":
+            require(all(len(row["compiler_pids"]) == 1 for row in rows), "native Mach-O compiler was not retained")
+            require(len({row["compiler_pids"][0] for row in rows}) == 1, "native Mach-O compiler restarted")
+        else:
+            require(all(not row["compiler_pids"] for row in rows), "unsupported C-bearing compiler was retained")
+    return lanes
 
 
 def source_checks(runner, zig, source, work, mac_arm):
@@ -400,7 +435,7 @@ def source_checks(runner, zig, source, work, mac_arm):
         "--test-filter", "Build.Cache"], work)
     require("depfile promotion preserves the observed content snapshot" in output,
             "release library did not run the required cache regression")
-    fixtures = ["c_include_cache"] + (["macho_incremental_inputs"] if mac_arm else [])
+    fixtures = ["c_include_cache", "c_runtime_rebuild"] + (["macho_incremental_inputs"] if mac_arm else [])
     for fixture in fixtures:
         original = source / "test/standalone" / fixture
         require((original / "build.zig").is_file(), "missing source regression: " + fixture)

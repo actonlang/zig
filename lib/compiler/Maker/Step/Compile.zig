@@ -45,9 +45,10 @@ pub fn make(
 
     try lowerZigArgs(arena, compile_index, maker, progress_node, &argv, false);
 
-    const native_bsp = maker.protocol_server != null and try maker.hasNativeInputs(arena, compile_index);
+    const native_inputs = try maker.hasNativeInputs(arena, compile_index);
+    const native_bsp = maker.protocol_server != null and native_inputs;
     if (native_bsp) {
-        // Keep C-bearing LLVM and non-executable steps on fresh compiler processes.
+        // Keep C-bearing steps without incremental linker support on fresh processes.
         // Incremental mode validates their C inputs without retaining linker state.
         var have_incremental = false;
         var have_linker = false;
@@ -73,7 +74,7 @@ pub fn make(
         maker,
         argv.items,
         progress_node,
-        !native_bsp and incremental and (maker.watch or maker.web_server != null or
+        !native_inputs and incremental and (maker.watch or maker.web_server != null or
             (maker.protocol_server != null and
                 ((conf_comp.flags2.use_llvm == .false and conf_comp.flags3.kind == .exe) or
                     (conf_comp.generated_bin.value == null and conf_comp.generated_llvm_bc.value != null)))),
