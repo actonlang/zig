@@ -290,7 +290,9 @@ pub fn serveSourcesTar(fuzz: *Fuzz, req: *std.http.Server.Request) !void {
         const compile_inputs = comp_step.inputs.table;
         for (compile_inputs.keys(), compile_inputs.values()) |dir_path, *file_list| {
             try dedup_table.ensureUnusedCapacity(gpa, file_list.items.len);
-            for (file_list.items) |sub_path| {
+            for (file_list.items) |input| {
+                if (input.existence_only) continue;
+                const sub_path = input.basename;
                 if (!std.mem.endsWith(u8, sub_path, ".zig")) continue;
                 const joined_path = try dir_path.join(arena, sub_path);
                 dedup_table.putAssumeCapacity(joined_path, {});
