@@ -153,8 +153,10 @@ def check_provenance(root, source, expected_version):
         require(checkout == commit, "archive source commit differs from --source checkout HEAD")
         for name, digest in actual.items():
             path = source / name
-            require(path.is_file() and sha256(path) == digest,
-                    "packaged library differs from --source checkout: " + name)
+            require(path.is_file(), "packaged library file is absent from --source checkout: " + name)
+            # Match build.zig's installDirectory blank_extensions policy.
+            expected = hashlib.sha256(b"").hexdigest() if name.endswith("test.zig") else sha256(path)
+            require(expected == digest, "packaged library differs from --source checkout: " + name)
     if "version" in provenance:
         require(provenance["version"] == expected_version, "provenance version mismatch")
     require(isinstance(provenance.get("target"), str), "missing provenance target")
