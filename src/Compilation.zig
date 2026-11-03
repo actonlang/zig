@@ -2921,6 +2921,12 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
     // these inputs to make it past AstGen, and once there, we can rely on
     // learning file system inputs from the Cache object.
 
+    // The old Mach-O linker rebuilds transient link state on flush, so it can
+    // accept a replacement C object before each incremental update.
+    if (comp.config.incremental) if (comp.bin_file) |file| {
+        if (file.cast(.macho)) |macho| macho.beginUpdate();
+    };
+
     // For compiling C objects, we rely on the cache hash system to avoid duplicating work.
     // Add a Job for each C object.
     if (comp.bin_file != null and comp.bin_file.?.post_prelink) {
@@ -2932,7 +2938,16 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
         // updates if we've done prelink already. https://codeberg.org/ziglang/zig/issues/32081
     } else {
         try comp.c_object_work_queue.ensureUnusedCapacity(gpa, comp.c_objects.items.len);
+        // Release every prior manifest lock before a worker can run. With
+        // duplicate C inputs, a worker may need an exclusive lock still held
+        // by another input; the async scheduler can execute workers inline.
         for (comp.c_objects.items) |c_object| {
+            if (c_object.clearStatus(gpa, io)) {
+                // OOM failures do not have a diagnostic entry.
+                comp.mutex.lockUncancelable(io);
+                defer comp.mutex.unlock(io);
+                _ = comp.failed_c_objects.swapRemove(c_object);
+            }
             comp.c_object_work_queue.pushBackAssumeCapacity(c_object);
             try comp.appendFileSystemInput(try .fromUnresolved(arena, comp.dirs, &.{c_object.src.src_path}));
         }
@@ -5532,15 +5547,6 @@ fn updateCObject(
     const gpa = comp.gpa;
     const io = comp.io;
 
-    if (c_object.clearStatus(gpa, io)) {
-        // There was previous failure.
-        comp.mutex.lockUncancelable(io);
-        defer comp.mutex.unlock(io);
-        // If the failure was OOM, there will not be an entry here, so we do
-        // not assert discard.
-        _ = comp.failed_c_objects.swapRemove(c_object);
-    }
-
     var man = comp.obtainCObjectCacheManifest(c_object.src.owner);
     defer man.deinit();
 
@@ -5954,7 +5960,7 @@ fn updateCObject(
         },
     };
 
-    try comp.queuePrelinkTasks(&.{.{ .load_object = c_object.status.success.object_path }});
+    try comp.queuePrelinkTasks(&.{.{ .load_c_object = c_object }});
 }
 
 fn updateWin32Resource(comp: *Compilation, win32_resource: *Win32Resource, win32_resource_prog_node: std.Progress.Node) !void {

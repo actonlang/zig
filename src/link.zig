@@ -1162,13 +1162,13 @@ pub const File = struct {
     }
 
     /// Opens a path as an object file and parses it into the linker.
-    fn openLoadObject(base: *File, path: Path) anyerror!void {
+    fn openLoadObject(base: *File, path: Path, c_object: ?*const Compilation.CObject) anyerror!void {
         if (base.tag == .lld) return;
         const io = base.comp.io;
         const diags = &base.comp.link_diags;
-        const input = try openObjectInput(io, diags, path);
-        errdefer input.object.file.close(io);
-        try loadInput(base, input);
+        var input = try openObjectInput(io, diags, path);
+        input.object.c_object = c_object;
+        try loadOwnedInput(base, input);
     }
 
     /// Opens a path as a static library and parses it into the linker.
@@ -1176,8 +1176,7 @@ pub const File = struct {
         if (base.tag == .lld) return;
         const io = base.comp.io;
         const archive = try openObject(io, path, must_link, false);
-        errdefer archive.file.close(io);
-        try loadInput(base, .{ .archive = archive });
+        try loadOwnedInput(base, .{ .archive = archive });
     }
 
     /// Opens a path as a static library and parses it into the linker. Allows GNU ld scripts.
@@ -1195,6 +1194,7 @@ pub const File = struct {
             },
             else => return err,
         };
+        if (base.tag == .macho) archive.file.close(io);
     }
 
     /// Opens a path as a shared library and parses it into the linker.
@@ -1213,6 +1213,7 @@ pub const File = struct {
             },
             else => return err,
         };
+        if (base.tag == .macho) dso.file.close(io);
     }
 
     fn loadGnuLdScript(base: *File, path: Path, parent_query: UnresolvedInput.Query, file: Io.File) anyerror!void {
@@ -1248,7 +1249,7 @@ pub const File = struct {
                     });
                     switch (Compilation.classifyFileExt(arg.path)) {
                         .shared_library => try openLoadDso(base, new_path, query),
-                        .object => try openLoadObject(base, new_path),
+                        .object => try openLoadObject(base, new_path, null),
                         .static_library => try openLoadArchiveQuery(base, new_path, query),
                         else => diags.addParseError(path, "GNU ld script references file with unrecognized extension: {s}", .{arg.path}),
                     }
@@ -1257,6 +1258,18 @@ pub const File = struct {
                 }
             }
         }
+    }
+
+    /// Submit a newly opened input, transferring its handle to the linker.
+    /// Old Mach-O keeps only metadata and opens its own handle during flush.
+    /// Explicit compilation inputs call loadInput directly because their cache
+    /// manifests still borrow the original handles.
+    fn loadOwnedInput(base: *File, input: Input) anyerror!void {
+        const io = base.comp.io;
+        const file = input.pathAndFile()[1];
+        errdefer file.close(io);
+        try loadInput(base, input);
+        if (base.tag == .macho) file.close(io);
     }
 
     pub fn loadInput(base: *File, input: Input) anyerror!void {
@@ -1522,6 +1535,8 @@ pub const PrelinkTask = union(enum) {
     load_host_libc,
     /// Tells the linker to load an object file by path.
     load_object: Path,
+    /// Stable source identity, even when its content-addressed object path changes.
+    load_c_object: *const Compilation.CObject,
     /// Tells the linker to load a static library by path.
     load_archive: struct {
         path: Path,
@@ -1617,8 +1632,7 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
                                 .{ crt_dir, target.libPrefix(), lib_name },
                             ) catch return diags.setAllocFailure());
                             if (tbd_path.root_dir.handle.openFile(io, tbd_path.sub_path, .{})) |file| {
-                                errdefer file.close(io);
-                                base.loadInput(.{ .tbd = .{
+                                base.loadOwnedInput(.{ .tbd = .{
                                     .path = tbd_path,
                                     .file = file,
                                     .needed = false,
@@ -1746,7 +1760,7 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
                             else => |e| diags.addParseError(path, "failed to parse archive: {s}", .{@errorName(e)}),
                         };
                     } else {
-                        base.openLoadObject(path) catch |err| switch (err) {
+                        base.openLoadObject(path, null) catch |err| switch (err) {
                             error.LinkFailure => return, // error reported via diags
                             else => |e| diags.addParseError(path, "failed to parse object: {s}", .{@errorName(e)}),
                         };
@@ -1757,9 +1771,18 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
         .load_object => |path| {
             const prog_node = comp.link_prog_node.start("Parse Object", 0);
             defer prog_node.end();
-            base.openLoadObject(path) catch |err| switch (err) {
+            base.openLoadObject(path, null) catch |err| switch (err) {
                 error.AlreadyReported => return, // error reported via diags
                 else => |e| diags.addParseError(path, "failed to parse object: {s}", .{@errorName(e)}),
+            };
+        },
+        .load_c_object => |c_object| {
+            const path = c_object.status.success.object_path;
+            const prog_node = comp.link_prog_node.start("Parse C Object", 0);
+            defer prog_node.end();
+            base.openLoadObject(path, c_object) catch |err| switch (err) {
+                error.AlreadyReported => return,
+                else => |e| diags.addParseError(path, "failed to parse C object: {s}", .{@errorName(e)}),
             };
         },
         .load_archive => |load_archive| {
@@ -1785,8 +1808,7 @@ pub fn doPrelinkTask(comp: *Compilation, task: PrelinkTask) void {
             const prog_node = comp.link_prog_node.start("Parse Shared Library Stub", 0);
             defer prog_node.end();
             if (path.root_dir.handle.openFile(io, path.sub_path, .{})) |file| {
-                errdefer file.close(io);
-                base.loadInput(.{ .tbd = .{
+                base.loadOwnedInput(.{ .tbd = .{
                     .path = path,
                     .file = file,
                     .needed = false,
@@ -2050,6 +2072,8 @@ pub const Input = union(enum) {
 
     pub const Object = struct {
         path: Path,
+        /// The C source owning this cached object; null for command-line inputs.
+        c_object: ?*const Compilation.CObject = null,
         file: Io.File,
         must_link: bool,
         hidden: bool,

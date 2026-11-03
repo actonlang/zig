@@ -5,6 +5,8 @@ pub const Relocation = @import("MachO/Relocation.zig");
 base: link.File,
 
 all_inputs: std.ArrayList(link.Input),
+flushed_once: bool = false,
+has_flush_diagnostics: bool = false,
 
 rpath_list: []const []const u8,
 
@@ -265,6 +267,7 @@ pub fn deinit(self: *MachO) void {
     const gpa = comp.gpa;
     const io = comp.io;
 
+    for (self.all_inputs.items) |input| gpa.free(input.path().sub_path);
     self.all_inputs.deinit(gpa);
 
     if (self.d_sym) |*d_sym| {
@@ -330,9 +333,119 @@ pub fn deinit(self: *MachO) void {
     self.thunks.deinit(gpa);
 }
 
+/// Prepare a retained old-linker update before new prelink work is queued.
+pub fn beginUpdate(self: *MachO) void {
+    if (self.has_flush_diagnostics) {
+        // A failed flush is retried from fresh link state. Initial prelink
+        // diagnostics are deliberately retained until their inputs are retried.
+        const comp = self.base.comp;
+        comp.link_diags.deinit();
+        comp.link_diags = .init(comp.gpa, comp.io);
+        self.has_flush_diagnostics = false;
+    }
+    self.base.post_prelink = false;
+}
+
 pub fn loadInput(self: *MachO, input: link.Input) link.Error!void {
     const gpa = self.base.comp.gpa;
-    try self.all_inputs.append(gpa, input);
+    // CObject.clearStatus frees the previous cached path before sending its
+    // replacement. Keep our own path and match C objects by stable source identity.
+    const sub_path = try gpa.dupe(u8, input.path().sub_path);
+    errdefer gpa.free(sub_path);
+    var owned = input;
+    switch (owned) {
+        inline else => |*payload| payload.path.sub_path = sub_path,
+    }
+    const identity = if (input == .object) input.object.c_object else null;
+    for (self.all_inputs.items) |*existing| {
+        const existing_identity = if (existing.* == .object) existing.object.c_object else null;
+        const replace = if (identity != null)
+            existing_identity == identity
+        else
+            existing_identity == null and existing.path().eql(input.path());
+        if (replace) {
+            gpa.free(existing.path().sub_path);
+            existing.* = owned;
+            return;
+        }
+    }
+    try self.all_inputs.append(gpa, owned);
+}
+
+fn resetFlushState(self: *MachO) void {
+    const gpa = self.base.comp.gpa;
+    const io = self.base.comp.io;
+    for (self.file_handles.items) |handle| handle.close(io);
+    self.file_handles.clearRetainingCapacity();
+    for (self.files.items(.tags), self.files.items(.data), 0..) |tag, *data, i| {
+        switch (tag) {
+            .null, .zig_object => continue,
+            .internal => data.internal.deinit(gpa),
+            .object => data.object.deinit(gpa),
+            .dylib => data.dylib.deinit(gpa),
+        }
+        self.files.set(i, .null);
+    }
+    self.files.len = if (self.zig_object) |index| index + 1 else 1;
+    self.objects.clearRetainingCapacity();
+    self.dylibs.clearRetainingCapacity();
+    self.internal_object = null;
+    self.resolver.reset();
+    for (self.undefs.values()) |*value| value.deinit(gpa);
+    self.undefs.clearRetainingCapacity();
+    for (self.dupes.values()) |*value| value.deinit(gpa);
+    self.dupes.clearRetainingCapacity();
+    for (0..self.sections.len) |i| {
+        self.sections.items(.atoms)[i].clearRetainingCapacity();
+        self.sections.items(.out)[i].clearRetainingCapacity();
+        self.sections.items(.relocs)[i].clearRetainingCapacity();
+        self.sections.items(.thunks)[i].clearRetainingCapacity();
+        const header = &self.sections.items(.header)[i];
+        header.nreloc = 0;
+        if (!self.isZigSection(@intCast(i)) and !self.isDebugSection(@intCast(i))) {
+            header.size = 0;
+            self.sections.items(.last_atom_index)[i] = 0;
+            self.sections.items(.free_list)[i].clearRetainingCapacity();
+        }
+    }
+    for (self.thunks.items) |*thunk| thunk.deinit(gpa);
+    self.thunks.clearRetainingCapacity();
+    self.symtab.clearRetainingCapacity();
+    self.strtab.clearRetainingCapacity();
+    self.indsymtab = .{};
+    self.got.deinit(gpa);
+    self.got = .{};
+    self.stubs.deinit(gpa);
+    self.stubs = .{};
+    self.stubs_helper = .{};
+    self.objc_stubs.deinit(gpa);
+    self.objc_stubs = .{};
+    self.la_symbol_ptr = .{};
+    self.tlv_ptr.deinit(gpa);
+    self.tlv_ptr = .{};
+    self.rebase_section.deinit(gpa);
+    self.rebase_section = .{};
+    self.bind_section.deinit(gpa);
+    self.bind_section = .{};
+    self.weak_bind_section.deinit(gpa);
+    self.weak_bind_section = .{};
+    self.lazy_bind_section.deinit(gpa);
+    self.lazy_bind_section = .{};
+    self.export_trie.deinit(gpa);
+    self.export_trie = .{};
+    self.unwind_info.deinit(gpa);
+    self.unwind_info = .{};
+    self.data_in_code.deinit(gpa);
+    self.data_in_code = .{};
+    if (self.getZigObject()) |zo| {
+        zo.output_symtab_ctx = .{};
+        for (zo.symbols.items) |*symbol| {
+            symbol.sect_flags.store(0, .seq_cst);
+            symbol.flags.import = false;
+            symbol.flags.@"export" = false;
+            symbol.flags.output_symtab = false;
+        }
+    }
 }
 
 pub fn flush(
@@ -350,6 +463,8 @@ pub fn flush(
     const gpa = comp.gpa;
     const io = comp.io;
     const diags = &comp.link_diags;
+
+    defer self.has_flush_diagnostics = diags.hasErrors();
 
     const sub_prog_node = prog_node.start("MachO Flush", 0);
     defer sub_prog_node.end();
@@ -381,6 +496,8 @@ pub fn flush(
     // --verbose-link
     if (comp.verbose_link) try self.dumpArgv(comp);
 
+    if (self.flushed_once) self.resetFlushState();
+    self.flushed_once = true;
     if (self.getZigObject()) |zo| try zo.flush(self, tid);
     if (self.base.isStaticLib()) return relocatable.flushStaticLib(self, comp);
     if (self.base.isObject()) return relocatable.flushObject(self, comp);
@@ -731,11 +848,15 @@ pub fn classifyInputFile(self: *MachO, input: link.Input) !void {
     const comp = self.base.comp;
     const io = comp.io;
 
-    const path, const file = input.pathAndFile();
+    const path = input.path();
+    const file = try path.root_dir.handle.openFile(io, path.sub_path, .{});
     // TODO don't classify now, it's too late. The input file has already been classified
     log.debug("classifying input file {f}", .{path});
 
-    const fh = try self.addFileHandle(file);
+    const fh = self.addFileHandle(file) catch |err| {
+        file.close(io);
+        return err;
+    };
     var buffer: [macho.ARMAG.len]u8 = undefined;
 
     const fat_arch: ?fat.Arch = try self.parseFatFile(file, path);
@@ -1988,6 +2109,10 @@ fn generateUnwindInfo(self: *MachO) !void {
 }
 
 fn initSegments(self: *MachO) !void {
+    for (self.segments.items) |*segment| {
+        segment.cmdsize = @sizeOf(macho.segment_command_64);
+        segment.nsects = 0;
+    }
     const gpa = self.base.comp.gpa;
     const slice = self.sections.slice();
 
@@ -2000,11 +2125,11 @@ fn initSegments(self: *MachO) !void {
             log.warn("requested __PAGEZERO size (0x{x}) is not page aligned", .{pagezero_size});
             log.warn("  rounding down to 0x{x}", .{aligned_pagezero_size});
         }
-        self.pagezero_seg_index = try self.addSegment("__PAGEZERO", .{ .vmsize = aligned_pagezero_size });
+        self.pagezero_seg_index = self.getSegmentByName("__PAGEZERO") orelse try self.addSegment("__PAGEZERO", .{ .vmsize = aligned_pagezero_size });
     }
 
     // __TEXT segment is non-optional
-    self.text_seg_index = try self.addSegment("__TEXT", .{ .prot = getSegmentProt("__TEXT") });
+    self.text_seg_index = self.getSegmentByName("__TEXT") orelse try self.addSegment("__TEXT", .{ .prot = getSegmentProt("__TEXT") });
 
     // Next, create segments required by sections
     for (slice.items(.header)) |header| {
@@ -2015,7 +2140,7 @@ fn initSegments(self: *MachO) !void {
     }
 
     // Add __LINKEDIT
-    self.linkedit_seg_index = try self.addSegment("__LINKEDIT", .{ .prot = getSegmentProt("__LINKEDIT") });
+    self.linkedit_seg_index = self.getSegmentByName("__LINKEDIT") orelse try self.addSegment("__LINKEDIT", .{ .prot = getSegmentProt("__LINKEDIT") });
 
     // Sort segments
     const Entry = struct {
@@ -2262,7 +2387,8 @@ fn allocateLinkeditSegment(self: *MachO) !void {
     var fileoff: u64 = 0;
     var vmaddr: u64 = 0;
 
-    for (self.segments.items) |seg| {
+    for (self.segments.items, 0..) |seg, index| {
+        if (index == self.linkedit_seg_index.?) continue;
         if (fileoff < seg.fileoff + seg.filesize) fileoff = seg.fileoff + seg.filesize;
         if (vmaddr < seg.vmaddr + seg.vmsize) vmaddr = seg.vmaddr + seg.vmsize;
     }
@@ -3621,6 +3747,14 @@ pub fn addSection(
     sectname: []const u8,
     opts: AddSectionOpts,
 ) !u8 {
+    if (self.getSectionByName(segname, sectname)) |index| {
+        const header = &self.sections.items(.header)[index];
+        header.@"align" = @max(header.@"align", opts.alignment);
+        header.flags = opts.flags;
+        header.reserved1 = opts.reserved1;
+        header.reserved2 = opts.reserved2;
+        return index;
+    }
     const gpa = self.base.comp.gpa;
     const index = @as(u8, @intCast(try self.sections.addOne(gpa)));
     self.sections.set(index, .{
