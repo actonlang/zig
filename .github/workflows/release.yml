@@ -19,6 +19,42 @@ concurrency:
   cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
 
 jobs:
+  host-bootstrap:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: host-cache
+        with:
+          path: |
+            host-work/host-bootstrap.tar.xz
+            host-work/host-bootstrap.tar.xz.sha256
+          key: host-bootstrap-${{ github.sha }}
+      - name: Bootstrap a compiler from the matching sources
+        if: steps.host-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          python3 ci/acton/build_host.py --work-dir host-work --jobs 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: failure()
+        with:
+          name: host-bootstrap-logs
+          path: |
+            host-work/*.log
+            host-work/commands.jsonl
+          if-no-files-found: ignore
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: host-bootstrap
+          path: |
+            host-work/host-bootstrap.tar.xz
+            host-work/host-bootstrap.tar.xz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
   llvm-intel-macos:
     runs-on: ubuntu-24.04
     timeout-minutes: 350
@@ -48,6 +84,7 @@ jobs:
           retention-days: 7
 
   build:
+    needs: host-bootstrap
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
@@ -62,8 +99,12 @@ jobs:
         with:
           path: release-work/downloads
           key: release-inputs-${{ matrix.target }}-${{ hashFiles('ci/acton/release-inputs.json') }}
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: host-bootstrap
+          path: host-bootstrap
       - name: Build a static compiler and its matching library
-        run: python3 ci/acton/build_release.py --target '${{ matrix.target }}' --work-dir release-work --jobs 2
+        run: python3 ci/acton/build_release.py --target '${{ matrix.target }}' --host-bootstrap host-bootstrap/host-bootstrap.tar.xz --work-dir release-work --jobs 2
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: package-${{ matrix.target }}
@@ -75,7 +116,7 @@ jobs:
           retention-days: 14
 
   build-intel-macos:
-    needs: llvm-intel-macos
+    needs: [host-bootstrap, llvm-intel-macos]
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -91,10 +132,14 @@ jobs:
           cd llvm-kit
           sha256sum -c *.sha256
           tar -xJf *.tar.xz
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: host-bootstrap
+          path: host-bootstrap
       - name: Build the Intel macOS compiler
         run: |
           kit=$(python3 -c 'import json; print(json.load(open("ci/acton/release-inputs.json"))["built_devkit"]["name"])')
-          python3 ci/acton/build_release.py --target x86_64-macos-none --llvm-kit "llvm-kit/$kit" --work-dir release-work --jobs 2
+          python3 ci/acton/build_release.py --target x86_64-macos-none --host-bootstrap host-bootstrap/host-bootstrap.tar.xz --llvm-kit "llvm-kit/$kit" --work-dir release-work --jobs 2
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: package-x86_64-macos-none

@@ -16,6 +16,7 @@ def main():
     parser.add_argument('--target', required=True, choices=['x86_64-linux-musl', 'aarch64-linux-musl', 'x86_64-macos-none', 'aarch64-macos-none'])
     parser.add_argument('--work-dir', type=Path, required=True)
     parser.add_argument('--llvm-kit', type=Path)
+    parser.add_argument('--host-bootstrap', type=Path, required=True)
     parser.add_argument('--jobs', type=int, default=2)
     args = parser.parse_args()
     if platform.system() != 'Linux' or platform.machine() not in ('x86_64', 'AMD64'):
@@ -31,9 +32,21 @@ def main():
     work = args.work_dir.resolve()
     work.mkdir(parents=True, exist_ok=True)
     downloads = work / 'downloads'
-    spec = metadata['bootstrap_compiler']
-    bootstrap = unpack(fetch(spec, downloads), work / 'bootstrap', spec['sha256'])
+    archive = args.host_bootstrap.resolve()
+    checksum_fields = Path(str(archive) + '.sha256').read_text().split()
+    checksum = digest(archive)
+    if checksum_fields != [checksum, archive.name]:
+        parser.error('Host bootstrap archive checksum mismatch')
+    bootstrap = unpack(archive, work / 'bootstrap', checksum)
+    host_identity = json.loads((bootstrap / 'provenance.json').read_text())
+    revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source, text=True).strip()
+    if host_identity['source_commit'] != revision or host_identity['inputs_sha256'] != digest(metadata_path):
+        parser.error('Host bootstrap does not match this source revision and inputs')
+    if host_identity['recipe_sha256'] != digest(Path(__file__).with_name('build_host.py')):
+        parser.error('Host bootstrap recipe does not match this release')
     zig = bootstrap / 'zig'
+    if host_identity['binary_sha256'] != digest(zig):
+        parser.error('Host bootstrap binary checksum mismatch')
     if args.llvm_kit:
         llvm = args.llvm_kit.resolve()
         provenance_path = llvm / 'provenance.json'
@@ -56,9 +69,6 @@ def main():
     env.pop('ZIG_LIB_DIR', None)
     env['ZIG_LOCAL_CACHE_DIR'] = str(work / 'local-cache')
     env['ZIG_GLOBAL_CACHE_DIR'] = str(work / 'global-cache')
-    actual = subprocess.check_output([zig, 'version'], env=env, text=True).strip()
-    if actual != metadata['bootstrap_version']:
-        parser.error('Unexpected bootstrap version: ' + actual)
     arch, system, _ = args.target.split('-')
     name = f'zig-{arch}-{system}-{version}'
     output = work / name
@@ -74,15 +84,14 @@ def main():
     for required in ('zig', 'lib/std/std.zig', 'lib/compiler/Maker.zig'):
         if not (output / required).is_file():
             parser.error('Missing installed file: ' + required)
-    revision = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source, text=True).strip()
-    # Only archive this exact source revision; a dirty source tree cannot claim it.
+    # Only archive this exact source revision; a changed tree cannot claim it.
     dirty = subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=source, text=True)
-    if dirty:
-        parser.error('Release source tree has tracked modifications')
+    if dirty or subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source, text=True).strip() != revision:
+        parser.error('Release source changed while building')
     notices = output / 'third-party-notices'
     shutil.copytree(Path(__file__).with_name('notices'), notices)
     provenance = {'version': version, 'source_commit': revision, 'target': target,
-                  'bootstrap': metadata['bootstrap_compiler'], 'llvm_kit': kit_identity,
+                  'bootstrap': host_identity, 'llvm_kit': kit_identity,
                   'inputs_sha256': digest(metadata_path), 'recipe_sha256': digest(Path(__file__)),
                   'binary_sha256': digest(output / 'zig'),
                   'notices_sha256': {str(p.relative_to(output)): digest(p)

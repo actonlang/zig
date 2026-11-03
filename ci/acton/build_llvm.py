@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import platform
 import shlex
+import shutil
 import subprocess
 
 
@@ -138,6 +139,7 @@ def main():
             raise SystemExit(f'Missing required static kit input: {required}')
     if any(p.suffix in ('.dylib', '.so') for p in prefix.rglob('*')):
         raise SystemExit('Static kit unexpectedly contains shared libraries')
+    shutil.copytree(Path(__file__).with_name('notices'), prefix / 'third-party-notices')
     provenance = {'inputs': inputs, 'inputs_sha256': digest(args.inputs), 'recipe_sha256': digest(Path(__file__)),
                   'target': target, 'cpu': cpu, 'jobs': args.jobs,
                   'bootstrap_binary_sha256': digest(zig), 'output_files': {

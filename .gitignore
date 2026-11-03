@@ -21,3 +21,5 @@ zig-out/
 /release-work/
 /llvm-kit/
 /packages/
+/host-work/
+/host-bootstrap/

@@ -8,7 +8,14 @@ its matching `lib/` tree. Acton does not rebuild Zig or apply these patches agai
 kits and the source archive used for the Intel macOS kit. Every download is
 checked before extraction. `version` names the next immutable release.
 
-The Release builds workflow builds four host packages on Linux: x86_64 and
+The Release builds workflow first uses upstream's CMake bootstrap to build
+`zig2` from the checked-in `stage1/zig1.wasm` and current sources. This host
+compiler and its current library share the same build protocol and APIs, even
+when they have changed since the latest downloadable nightly. The pinned
+nightly supplies C/C++ compilation for this bootstrap and the Intel LLVM kit.
+The host bootstrap is an internal CI artifact, not a release package.
+
+That host compiler then builds four release packages on Linux: x86_64 and
 AArch64 Linux, and x86_64 and AArch64 macOS. Linux packages target musl and do
 not depend on the build host's glibc. macOS packages target macOS 15. LLVM,
 Clang, LLD and their support libraries are linked statically. Each archive is
@@ -41,9 +48,10 @@ its compiler, library and dependency provenance.
 The scripts require Python 3.12+, CMake and Ninja on x86_64 Linux:
 
 ```
-python3 ci/acton/build_release.py --target aarch64-macos-none --work-dir /tmp/zig-release
+python3 ci/acton/build_host.py --work-dir /tmp/zig-host --jobs 2
+python3 ci/acton/build_release.py --host-bootstrap /tmp/zig-host/host-bootstrap.tar.xz --target aarch64-macos-none --work-dir /tmp/zig-release
 python3 ci/acton/build_llvm.py --work-dir /tmp/zig-llvm --jobs 2
 ```
 
-The second command builds the Intel macOS dependency kit. Pass its output
+The last command builds the Intel macOS dependency kit. Pass its output
 folder as `--llvm-kit` when building `x86_64-macos-none`.
