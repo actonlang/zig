@@ -4709,12 +4709,18 @@ fn writeDepFile(
 
     if (fsi.len > 0) {
         var it = std.mem.splitScalar(u8, fsi, 0);
-        while (it.next()) |input| try w.print(" \\\n {f}{s}", .{ prefixes[input[0] - 1], input[1..] });
+        while (it.next()) |input| {
+            const header: std.zig.Server.Message.FileSystemInput = @bitCast(input[0]);
+            try w.print(" \\\n {f}{s}", .{ prefixes[header.prefix - 1], input[1..] });
+        }
     }
 
     if (fsi.len > 0) {
         var it = std.mem.splitScalar(u8, fsi, 0);
-        while (it.next()) |input| try w.print("\n\n{f}{s}:", .{ prefixes[input[0] - 1], input[1..] });
+        while (it.next()) |input| {
+            const header: std.zig.Server.Message.FileSystemInput = @bitCast(input[0]);
+            try w.print("\n\n{f}{s}:", .{ prefixes[header.prefix - 1], input[1..] });
+        }
     }
 
     try w.writeByte('\n');

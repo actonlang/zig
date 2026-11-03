@@ -47,9 +47,8 @@ pub const Message = struct {
         test_started,
         /// Body is a series of strings, delimited by null bytes.
         /// Each string is a prefixed file path.
-        /// The first byte indicates the file prefix path (see prefixes fields
-        /// of Cache). This byte is sent over the wire incremented so that null
-        /// bytes are not confused with string terminators.
+        /// The first byte is a FileSystemInput header. Its prefix is sent
+        /// incremented so that null bytes are not confused with separators.
         /// The remaining bytes is the file path relative to that prefix.
         /// The prefixes are hard-coded in Compilation.create (cwd, zig lib dir, local cache dir)
         file_system_inputs,
@@ -150,6 +149,15 @@ pub const Message = struct {
         index: Configuration.GeneratedFileIndex,
         /// Includes only the path bytes, not the prefix or null byte.
         path_len: u32,
+    };
+
+    /// Header byte preceding each path in file_system_inputs. The compiler and
+    /// its build runner must use the same protocol version.
+    pub const FileSystemInput = packed struct(u8) {
+        /// One plus the PathPrefix tag; zero is reserved for path separators.
+        prefix: u7,
+        /// Only existence and file kind matter, not contents or timestamps.
+        existence_only: bool = false,
     };
 
     pub const PathPrefix = enum(u8) {

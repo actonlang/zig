@@ -203,7 +203,9 @@ const Os = switch (builtin.os.tag) {
             // Add missing marks and note persisted ones.
             for (steps) |step_index| {
                 const step = maker.stepByIndex(step_index);
-                for (step.inputs.table.keys(), step.inputs.table.values()) |path, *files| {
+                for (step.inputs.table.keys(), step.inputs.table.values()) |input_path, *files| {
+                    const directory = try nearestDirectory(maker.graph.io, input_path);
+                    const path = directory.path;
                     const reaction_set = rs: {
                         const gop = try w.dir_table.getOrPut(gpa, path);
                         if (!gop.found_existing) {
@@ -259,7 +261,8 @@ const Os = switch (builtin.os.tag) {
                         }
                         break :rs &w.os.handle_table.values()[gop.index].reaction_set;
                     };
-                    for (files.items) |basename| {
+                    for (files.items) |input| {
+                        const basename = directory.basename orelse input.basename;
                         const gop = try reaction_set.getOrPut(gpa, basename);
                         if (!gop.found_existing) gop.value_ptr.* = .empty;
                         try gop.value_ptr.put(gpa, step_index, w.generation);
@@ -583,7 +586,9 @@ const Os = switch (builtin.os.tag) {
             // Add missing marks and note persisted ones.
             for (steps) |step_index| {
                 const step = maker.stepByIndex(step_index);
-                for (step.inputs.table.keys(), step.inputs.table.values()) |path, *files| {
+                for (step.inputs.table.keys(), step.inputs.table.values()) |input_path, *files| {
+                    const directory = try nearestDirectory(maker.graph.io, input_path);
+                    const path = directory.path;
                     const dir = dir: {
                         const gop = try w.dir_table.getOrPut(gpa, path);
                         if (!gop.found_existing) {
@@ -608,7 +613,8 @@ const Os = switch (builtin.os.tag) {
                         }
                         break :dir w.os.handle_table.keys()[gop.index];
                     };
-                    for (files.items) |basename| {
+                    for (files.items) |input| {
+                        const basename = directory.basename orelse input.basename;
                         const gop = try dir.reaction_set.getOrPut(gpa, basename);
                         if (!gop.found_existing) gop.value_ptr.* = .empty;
                         try gop.value_ptr.put(gpa, step_index, w.generation);
@@ -745,7 +751,9 @@ const Os = switch (builtin.os.tag) {
             const handles = &w.os.handles;
             for (steps) |step_index| {
                 const step = maker.stepByIndex(step_index);
-                for (step.inputs.table.keys(), step.inputs.table.values()) |path, *files| {
+                for (step.inputs.table.keys(), step.inputs.table.values()) |input_path, *files| {
+                    const directory = try nearestDirectory(maker.graph.io, input_path);
+                    const path = directory.path;
                     const reaction_set = rs: {
                         const gop = try w.dir_table.getOrPut(gpa, path);
                         if (!gop.found_existing) {
@@ -776,7 +784,8 @@ const Os = switch (builtin.os.tag) {
 
                         break :rs &handles.items(.rs)[gop.index];
                     };
-                    for (files.items) |basename| {
+                    for (files.items) |input| {
+                        const basename = directory.basename orelse input.basename;
                         const gop = try reaction_set.getOrPut(gpa, basename);
                         if (!gop.found_existing) gop.value_ptr.* = .empty;
                         try gop.value_ptr.put(gpa, step_index, w.generation);
@@ -940,6 +949,25 @@ const Os = switch (builtin.os.tag) {
     },
     else => void,
 };
+
+/// Keep exact dependencies in Step.inputs, but attach OS watches to existing
+/// directories. Creation of the first missing component causes registration to
+/// move inward on the next update, without collapsing logical symlink/.. paths.
+pub fn nearestDirectory(io: Io, path: Cache.Path) !struct { path: Cache.Path, basename: ?[]const u8 } {
+    var directory = path;
+    var basename: ?[]const u8 = null;
+    while (true) {
+        const stat = directory.root_dir.handle.statFile(io, directory.subPathOrDot(), .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => null,
+            else => return err,
+        };
+        if (stat) |info| if (info.kind == .directory) return .{ .path = directory, .basename = basename };
+        const parent = directory.dirname() orelse return error.FileNotFound;
+        if (parent.eql(directory)) return error.FileNotFound;
+        basename = directory.basename();
+        directory = parent;
+    }
+}
 
 pub fn init(maker: *Maker) !Watch {
     return Os.init(maker);
