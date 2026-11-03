@@ -99,9 +99,15 @@ def main():
     # current compiler as C. Do not invoke an older compiler's build runner.
     run('build', ['cmake', '--build', build, '--target', 'zig2', '--parallel', args.jobs])
     binary = build / 'zig2'
-    actual = subprocess.check_output([binary, 'version'], cwd=source, env=env, text=True).strip()
-    if actual != version:
-        parser.error('Source-matched compiler has unexpected version: ' + actual)
+    # zig2 deliberately omits the version command. Check its embedded version
+    # through compilation, then exercise the matching configure protocol.
+    smoke = work / 'smoke.zig'
+    smoke.write_text('const std = @import("std");\n'
+                     'comptime { if (!std.mem.eql(u8, @import("builtin").zig_version_string, '
+                     + json.dumps(version) + ')) @compileError("bootstrap version mismatch"); }\n'
+                     'pub fn main() void {}\n')
+    run('smoke', [binary, 'run', '--zig-lib-dir', source / 'lib', smoke, '-fllvm', '-lc'])
+    run('configure-smoke', [binary, 'build', '--zig-lib=lib', '--help'])
     segments = subprocess.check_output(['readelf', '-lW', binary], text=True)
     dynamic = subprocess.check_output(['readelf', '-dW', binary], text=True)
     if re.search(r'^\s*INTERP\s', segments, re.M) or '(NEEDED)' in dynamic:
