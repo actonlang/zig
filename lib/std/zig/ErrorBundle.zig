@@ -391,8 +391,7 @@ pub const Wip = struct {
 
     pub fn toOwnedBundle(wip: *Wip, compile_log_text: []const u8) !ErrorBundle {
         const gpa = wip.gpa;
-        if (wip.root_list.items.len == 0) {
-            assert(compile_log_text.len == 0);
+        if (wip.root_list.items.len == 0 and compile_log_text.len == 0) {
             // Special encoding when there are no errors.
             wip.deinit();
             wip.* = .{

@@ -2238,6 +2238,31 @@ pub const Manifest = struct {
         pub fn path(scf: *const SelfContainedFiles, file_offset: File.Offset) [:0]const u8 {
             return file_offset.path(scf.contents.items);
         }
+
+        /// Validate against the original manifest without blessing concurrent edits.
+        /// Directory dependencies retain their non-recursive contents semantics.
+        pub fn changed(scf: *const SelfContainedFiles, cache: *Cache) !bool {
+            var manifest = cache.obtain();
+            defer manifest.deinit();
+            try manifest.contents.appendSlice(cache.gpa, scf.contents.items);
+            var diagnostic: CheckDiagnostic = undefined;
+            for (scf.files.keys()) |offset| {
+                const result = manifest.checkDiscoveredPath(&diagnostic, offset, manifest.contents.items) catch |err| switch (err) {
+                    error.CacheCheckFailed => return true,
+                    else => |e| return e,
+                };
+                switch (result) {
+                    .hit => {},
+                    .metadata_changed => {
+                        // Coarse timestamps are deliberately normalized to zero.
+                        // Compare normalized metadata to avoid reload loops.
+                        if (!mem.eql(u8, &offset.getConst(scf.contents.items).digest, &offset.getConst(manifest.contents.items).digest)) return true;
+                    },
+                    else => return true,
+                }
+            }
+            return false;
+        }
     };
 
     pub fn takeFiles(m: *Manifest) SelfContainedFiles {
@@ -3125,7 +3150,7 @@ test "existence-only dependency is promoted to content tracking" {
 
 test "inconsistent dependency observations have a diagnostic" {
     const diagnostic: Manifest.AddDiscoveredPathDiagnostic = .inconsistent_observations;
-    const message = try testing.allocator.print( "{f}", .{diagnostic});
+    const message = try testing.allocator.print("{f}", .{diagnostic});
     defer testing.allocator.free(message);
     try testing.expectEqualStrings("path changed during dependency collection", message);
 }
@@ -3226,7 +3251,7 @@ fn testDepFileLogicalPath(absolute: bool) !void {
     defer testing.allocator.free(prerequisite);
     const escaped = try mem.replaceOwned(u8, testing.allocator, prerequisite, " ", "\\ ");
     defer testing.allocator.free(escaped);
-    const depfile = try testing.allocator.print( "object.o: {s}\n", .{escaped});
+    const depfile = try testing.allocator.print("object.o: {s}\n", .{escaped});
     defer testing.allocator.free(depfile);
     try tmp.dir.writeFile(io, .{ .sub_path = "object.d", .data = depfile });
     var original_digest: BinDigest = undefined;
