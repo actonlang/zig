@@ -3,6 +3,9 @@
     .fingerprint = 0xc0dbdf9c3b92810b,
     .version = "0.0.0",
     .dependencies = .{
+        .c_include_cache = .{
+            .path = "c_include_cache",
+        },
         .simple = .{
             .path = "simple",
         },

@@ -5485,6 +5485,31 @@ fn reportRetryableWin32ResourceError(
     }
 }
 
+// Preserve every discovered input on both C-object cache hits and misses.
+// This includes failed include lookups, which are absent from Clang depfiles.
+fn recordCObjectInputs(comp: *Compilation, man: *const Cache.Manifest) (Allocator.Error || Io.Cancelable)!void {
+    const gpa = comp.gpa;
+    const io = comp.io;
+    if (comp.file_system_inputs) |fsi| {
+        var inputs: std.ArrayList(u8) = .empty;
+        defer inputs.deinit(gpa);
+        try man.populateFileSystemInputs(&inputs);
+        comp.mutex.lockUncancelable(io);
+        defer comp.mutex.unlock(io);
+        if (fsi.items.len != 0 and inputs.items.len != 0) try fsi.append(gpa, 0);
+        try fsi.appendSlice(gpa, inputs.items);
+    }
+    switch (comp.cache_use) {
+        .whole => |whole| if (whole.cache_manifest) |whole_manifest| {
+            try whole.cache_manifest_mutex.lock(io);
+            defer whole.cache_manifest_mutex.unlock(io);
+            // Both manifests use comp.cache_parent's prefix table.
+            try whole_manifest.addDiscoveredManifest(man, .{ 0, 1, 2, 3, 4 });
+        },
+        .incremental, .none => {},
+    }
+}
+
 fn updateCObject(
     comp: *Compilation,
     c_object: *CObject,
@@ -5558,7 +5583,10 @@ fn updateCObject(
                 },
             };
             log.debug("C object {q} cache {f}", .{ c_object.src.src_path, status.fmt(&man) });
-            if (status == .hit) break :d man.hitDigestHex();
+            if (status == .hit) {
+                try comp.recordCObjectInputs(&man);
+                break :d man.hitDigestHex();
+            }
         }
         var argv: std.array_list.Managed([]const u8) = .init(gpa);
         defer argv.deinit();
@@ -5662,6 +5690,14 @@ fn updateCObject(
         else
             try std.fmt.allocPrint(arena, "{s}.d", .{out_obj_path});
 
+        const out_inputs_path = if (out_dep_path) |p|
+            try std.fmt.allocPrint(arena, "{s}.inputs", .{p})
+        else
+            null;
+        if (out_inputs_path) |p| {
+            try argv.appendSlice(&.{ "-Xclang", "-zig-cache-dependencies", "-Xclang", p });
+        }
+
         try comp.addCCArgs(arena, &argv, ext, out_dep_path, c_object.src.owner);
         try argv.appendSlice(c_object.src.extra_flags);
         try argv.appendSlice(c_object.src.cache_exempt_flags);
@@ -5699,6 +5735,10 @@ fn updateCObject(
             error.FileNotFound => {}, // the file wasn't created due to an error we reported
             else => log.warn("failed to delete {q}: {t}", .{ dep_file_path, err }),
         };
+        defer if (out_inputs_path) |p| zig_cache_tmp_dir.deleteFile(io, fs.path.basename(p)) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => log.warn("failed to delete {q}: {t}", .{ p, err }),
+        };
         if (std.process.can_spawn) {
             var diags: EvalZigLlvmProcessDiagnostics = undefined;
             const result = comp.evalZigLlvmProcess(arena, &diags, argv.items) catch |err| switch (err) {
@@ -5730,6 +5770,10 @@ fn updateCObject(
                             log.err("{}: failed to parse clang diagnostics: {s}", .{ err, result.stderr });
                             return comp.failCObj(c_object, "clang exited with code {d}", .{code});
                         };
+                        if (bundle.diags.len == 0) {
+                            bundle.destroy(gpa);
+                            return comp.failCObjRetryable(c_object, "clang exited with code {d}: {s}", .{ code, result.stderr });
+                        }
                         return comp.failCObjWithOwnedDiagBundle(c_object, bundle);
                     } else {
                         log.err("clang failed with stderr: {s}", .{result.stderr});
@@ -5773,40 +5817,46 @@ fn updateCObject(
                 .sub_path = fs.path.basename(raw_dep_file_path),
             };
 
-            if (comp.file_system_inputs != null) {
-                // TODO instead of this rely on passing the manifest contents directly
-
-                // Use the same file size limit as the cache code does for dependency files.
-                const dep_file_contents = dep_file_path.root_dir.handle.readFileAlloc(io, dep_file_path.sub_path, gpa, .unlimited) catch |err| switch (err) {
+            const inputs_path = out_inputs_path.?;
+            const inputs = zig_cache_tmp_dir.readFileAlloc(io, fs.path.basename(inputs_path), gpa, .unlimited) catch |err| switch (err) {
+                error.OutOfMemory, error.Canceled => |e| return e,
+                else => |e| return comp.failCObjRetryable(c_object, "failed to read '{s}': {t}", .{ inputs_path, e }),
+            };
+            defer gpa.free(inputs);
+            var records = inputs;
+            while (records.len != 0) {
+                if (records.len < 26 or (records[0] != 'm' and records[0] != 'f' and records[0] != 'd' and records[0] != 'r'))
+                    return comp.failCObjRetryable(c_object, "invalid cache dependency in '{s}'", .{inputs_path});
+                const path_end = mem.indexOfScalarPos(u8, records, 25, 0) orelse
+                    return comp.failCObjRetryable(c_object, "unterminated cache dependency in '{s}'", .{inputs_path});
+                const path = records[25..path_end];
+                if (path.len == 0 or !fs.path.isAbsolute(path))
+                    return comp.failCObjRetryable(c_object, "invalid cache dependency path in '{s}'", .{inputs_path});
+                const exists = records[0] != 'm';
+                var input_diag: Cache.Manifest.AddDiscoveredPathDiagnostic = .none;
+                man.addDiscoveredPath(.{
+                    // Keep logical components: resolving symlink/.. lexically changes the lookup.
+                    .discovered_path = .{ .prefixed = .{ .prefix = 0, .sub_path = path } },
+                    .handle = if (records[0] == 'd') .{ .dir = null } else .{ .file = null },
+                    // Opened backing files may not appear under this spelling in a VFS depfile.
+                    .existence_only = records[0] != 'r',
+                    .metadata_only = true,
+                    .exists = exists,
+                    .stat = if (exists) .{
+                        .size = mem.readInt(u64, records[1..9], .little),
+                        .inode = @bitCast(@as(@Int(.unsigned, @bitSizeOf(Io.File.INode)), @truncate(mem.readInt(u64, records[9..17], .little)))),
+                        .mtime = .fromNanoseconds(mem.readInt(i64, records[17..25], .little)),
+                    } else null,
+                    .diagnostic = &input_diag,
+                }) catch |err| switch (err) {
                     error.OutOfMemory, error.Canceled => |e| return e,
-                    else => |e| return comp.failCObjRetryable(
+                    error.FileSystemFailure => return comp.failCObjRetryable(
                         c_object,
-                        "failed to read '{f}': {t}",
-                        .{ dep_file_path, e },
+                        "failed to record cache dependency '{s}': {f}",
+                        .{ path, input_diag },
                     ),
                 };
-                defer gpa.free(dep_file_contents);
-
-                var str_buf: std.ArrayList(u8) = .empty;
-                defer str_buf.deinit(gpa);
-
-                var it: std.Build.Cache.DepTokenizer = .{ .bytes = dep_file_contents };
-                while (it.next()) |token| {
-                    const input_path: Compilation.Path = switch (token) {
-                        .target, .target_must_resolve => continue,
-                        .prereq => |file_path| try .fromUnresolved(arena, comp.dirs, &.{file_path}),
-                        .prereq_must_resolve => p: {
-                            try token.resolve(gpa, &str_buf);
-                            break :p try .fromUnresolved(arena, comp.dirs, &.{str_buf.items});
-                        },
-                        else => |err_token| return comp.failCObjRetryable(
-                            c_object,
-                            "failed parsing '{f}': {f}",
-                            .{ dep_file_path, err_token },
-                        ),
-                    };
-                    try comp.appendFileSystemInput(input_path);
-                }
+                records = records[path_end + 1 ..];
             }
 
             // Add the files depended on to the cache system.
@@ -5832,36 +5882,7 @@ fn updateCObject(
                     .{ dep_file_path, e },
                 ),
             };
-            switch (comp.cache_use) {
-                .whole => |whole| {
-                    if (whole.cache_manifest) |whole_cache_manifest| {
-                        try whole.cache_manifest_mutex.lock(io);
-                        defer whole.cache_manifest_mutex.unlock(io);
-                        whole_cache_manifest.addDiscoveredDepFile(dep_file_path, &diags) catch |err| switch (err) {
-                            error.OutOfMemory,
-                            error.Canceled,
-                            => |e| return e,
-
-                            error.InvalidDepFile => return comp.failCObjRetryable(
-                                c_object,
-                                "failed to parse '{f}': {f}",
-                                .{ dep_file_path, diags.dep_tokenizer },
-                            ),
-                            error.FileSystemFailure => return comp.failCObjRetryable(
-                                c_object,
-                                "failed to parse '{f}': {f}",
-                                .{ dep_file_path, diags.add_discovered_path },
-                            ),
-                            else => |e| return comp.failCObjRetryable(
-                                c_object,
-                                "failed to read '{f}': {t}",
-                                .{ dep_file_path, e },
-                            ),
-                        };
-                    }
-                },
-                .incremental, .none => {},
-            }
+            try comp.recordCObjectInputs(&man);
         }
 
         // We don't actually care whether it's a cache hit or miss; we just need the digest and the lock.
