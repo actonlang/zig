@@ -155,10 +155,16 @@ comptime {
 
         _ = @import("compiler_rt/memcpy.zig");
         if (!ofmt_c) {
-            symbol(&memset, "memset");
+            // Prefer libc's optimized fill when it provides one.
+            // Zig's bundled musl gets memset from compiler-rt.
+            if (!builtin.link_libc or builtin.target.isMuslLibC())
+                symbol(&memset, "memset");
         }
         _ = @import("compiler_rt/memmove.zig");
-        symbol(&memcmp, "memcmp");
+        // Prefer libc's optimized comparison when it provides one.
+        // Zig's bundled musl gets memcmp from compiler-rt.
+        if (!builtin.link_libc or builtin.target.isMuslLibC())
+            symbol(&memcmp, "memcmp");
         symbol(&bcmp, "bcmp");
         _ = @import("compiler_rt/ssp.zig");
         symbol(&strlen, "strlen");
