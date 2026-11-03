@@ -3,6 +3,9 @@
     .fingerprint = 0xc0dbdf9c3b92810b,
     .version = "0.0.0",
     .dependencies = .{
+        .c_runtime_rebuild = .{
+            .path = "c_runtime_rebuild",
+        },
         .macho_incremental_inputs = .{
             .path = "macho_incremental_inputs",
         },
