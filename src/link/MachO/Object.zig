@@ -97,6 +97,41 @@ pub fn deinit(self: *Object, allocator: Allocator) void {
     self.data_in_code.deinit(allocator);
 }
 
+/// Copy the pristine parse result before the linker mutates symbol and atom state.
+pub fn cloneParsed(self: Object, allocator: Allocator) !Object {
+    var copy = self;
+    copy.path = &.{};
+    copy.in_archive = null;
+    copy.sections = .empty;
+    copy.symtab = .empty;
+    const lists = .{ "strtab", "symbols", "symbols_extra", "globals", "atoms", "atoms_indexes", "atoms_extra", "cies", "fdes", "eh_frame_data", "unwind_records", "unwind_records_indexes", "data_in_code", "stab_files" };
+    inline for (lists) |name| @field(copy, name) = .empty;
+    errdefer copy.deinit(allocator);
+    copy.path = try allocator.dupe(u8, self.path);
+    if (self.in_archive) |archive| {
+        const path = try allocator.dupe(u8, archive.path);
+        copy.in_archive = archive;
+        copy.in_archive.?.path = path;
+    }
+    copy.sections = try self.sections.clone(allocator);
+    for (copy.sections.items(.relocs), copy.sections.items(.subsections)) |*relocs, *subsections| {
+        relocs.* = .empty;
+        subsections.* = .empty;
+    }
+    for (0..self.sections.len) |i| {
+        copy.sections.items(.relocs)[i] = try self.sections.items(.relocs)[i].clone(allocator);
+        copy.sections.items(.subsections)[i] = try self.sections.items(.subsections)[i].clone(allocator);
+    }
+    copy.symtab = try self.symtab.clone(allocator);
+    inline for (lists) |name| {
+        if (!std.mem.eql(u8, name, "stab_files")) @field(copy, name) = try @field(self, name).clone(allocator);
+    }
+    copy.stab_files = try self.stab_files.clone(allocator);
+    for (copy.stab_files.items) |*sf| sf.stabs = .empty;
+    for (copy.stab_files.items, self.stab_files.items) |*out, input| out.stabs = try input.stabs.clone(allocator);
+    return copy;
+}
+
 pub fn parse(self: *Object, macho_file: *MachO) !void {
     const tracy = trace(@src());
     defer tracy.end();
