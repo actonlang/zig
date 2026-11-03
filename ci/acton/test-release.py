@@ -16,6 +16,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import traceback
 
 
 class Failure(Exception):
@@ -38,10 +39,20 @@ def sha256(path):
 def stop_group(process):
     # A leader can exit while one of its descendants still owns a pipe.
     for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(process.pid, sig)
-        except ProcessLookupError:
-            pass
+        deadline = time.monotonic() + 2
+        while True:
+            try:
+                os.killpg(process.pid, sig)
+                break
+            except ProcessLookupError:
+                break
+            except PermissionError:
+                # macOS can report EPERM while the last group member exits.
+                # Only accept a successful signal or ESRCH; persistent denial
+                # must still fail cleanup.
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
         try:
             process.wait(timeout=2)
         except subprocess.TimeoutExpired:
@@ -403,6 +414,7 @@ class BuildServer:
 def bsp_checks(runner, zig, work, target):
     work.mkdir()
     lanes = {}
+    runner.report["bsp"] = lanes
     for backend in ("llvm", "native"):
         lane = work / backend
         lane.mkdir()
@@ -523,6 +535,7 @@ def main():
             report["source_tests"] = "not requested"
     except (Failure, OSError, ValueError, tarfile.TarError, subprocess.SubprocessError) as error:
         report["failure"] = str(error)
+        report["failure_traceback"] = traceback.format_exc()
     finally:
         (output / "results.json").write_text(json.dumps(report, indent=2) + "\n")
     print(("FAIL: " + report["failure"] if report["failure"] else "PASS") + "; evidence: " + str(output))

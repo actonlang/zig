@@ -176,6 +176,8 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: "3.13"
+      - name: Test validator cleanup
+        run: python3 ci/acton/test_release_cleanup.py
       - name: Check the archive and run it after relocation
         run: python3 ci/acton/test-release.py --archive packages/zig-*.tar.xz --version "$(cat ci/acton/version)" --source "$PWD" --output "${{ runner.temp }}/release-check"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -200,6 +202,8 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
         with:
           python-version: "3.13"
+      - name: Test validator cleanup
+        run: python3 ci/acton/test_release_cleanup.py
       - name: Check the archive and run it after relocation
         run: python3 ci/acton/test-release.py --archive packages/zig-*.tar.xz --version "$(cat ci/acton/version)" --source "$PWD" --output "${{ runner.temp }}/release-check"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
