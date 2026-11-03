@@ -30,6 +30,11 @@ subsequent compiler releases reuse the kit. New source revisions keep an
 in-progress dependency build running; kit jobs serialize and restore its cache
 once it finishes.
 
+The build server stays alive across build requests. C-bearing steps retain
+their compiler only with the native backend and old Mach-O linker, which can
+refresh C inputs. Other C-bearing steps use a fresh compiler for each request.
+This avoids stale C output on linkers that do not implement those updates.
+
 To prepare a release:
 
 1. Fetch upstream and rebase the compiler fixes. Keep independent fixes in
