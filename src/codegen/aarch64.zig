@@ -160,7 +160,7 @@ pub fn generate(
         switch (ret_vi.value.parent(&isel)) {
             .unallocated, .stack_slot => {},
             .value, .constant => unreachable,
-            .address => |address_vi| try address_vi.liveIn(
+            .address => |address_vi| try address_vi.defLiveIn(
                 &isel,
                 address_vi.hint(&isel).?,
                 comptime &.initFill(.free),
