@@ -16873,3 +16873,12 @@ void c_win64_varargs_f64_u64_f64_u64(double a, uint64_t b, double c, uint64_t d)
     assert_or_panic(c == 7.0);
     assert_or_panic(d == UINT64_C(0x4020000000000000));
 }
+
+extern void zig_conditional_initialize(void);
+extern int zig_conditional_value(void), zig_conditional_return(int);
+void c_check_conditional_return(void) {
+    zig_conditional_initialize();
+    assert_or_panic(zig_conditional_value() == 42);
+    assert_or_panic(zig_conditional_return(0) == 42);
+    assert_or_panic(zig_conditional_return(1) == 7);
+}
