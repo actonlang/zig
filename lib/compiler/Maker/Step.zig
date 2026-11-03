@@ -457,6 +457,8 @@ pub fn addError(step: *Step, maker: *const Maker, comptime fmt: []const u8, args
 }
 
 pub const ZigProcess = struct {
+    /// Exact lowered command, including paths to generated ABI modules.
+    argv: []const u8,
     child: std.process.Child,
     multi_reader_buffer: Io.File.MultiReader.Buffer(2),
     multi_reader: Io.File.MultiReader,
@@ -468,14 +470,15 @@ pub const ZigProcess = struct {
         zp.progress_ipc_index = if (std.Progress.have_ipc) prog_node.takeIpcIndex() else null;
     }
 
-    pub fn deinit(zp: *ZigProcess, io: Io) void {
+    pub fn deinit(zp: *ZigProcess, gpa: Allocator, io: Io) void {
         zp.child.kill(io);
+        gpa.free(zp.argv);
         zp.multi_reader.deinit();
         zp.* = undefined;
     }
 
     pub fn destroy(zp: *ZigProcess, gpa: Allocator, io: Io) void {
-        zp.deinit(io);
+        zp.deinit(gpa, io);
         gpa.destroy(zp);
     }
 };
@@ -507,6 +510,16 @@ pub fn evalZigProcess(
 
     // If an error occurs, it's happened in this command:
     errdefer s.setFailedCommand(gpa, argv, .{});
+
+    // argv cannot contain NUL bytes, so this is an exact command comparison.
+    const command = try std.mem.join(gpa, "\x00", argv);
+    defer gpa.free(command);
+    if (s.getZigProcess()) |zp| {
+        if (!watch or !std.mem.eql(u8, zp.argv, command)) {
+            s.clearZigProcess();
+            zp.destroy(gpa, io);
+        }
+    }
 
     if (s.getZigProcess()) |zp| update: {
         assert(watch);
@@ -552,6 +565,10 @@ pub fn evalZigProcess(
 
     const zp = try gpa.create(ZigProcess);
     defer if (!watch) gpa.destroy(zp);
+    zp.argv = gpa.dupe(u8, command) catch |err| {
+        if (watch) gpa.destroy(zp);
+        return err;
+    };
 
     zp.child = std.process.spawn(io, .{
         .argv = argv,
@@ -561,13 +578,17 @@ pub fn evalZigProcess(
         .stderr = .pipe,
         .request_resource_usage_statistics = true,
         .progress_node = prog_node,
-    }) catch |err| return s.fail(maker, "failed to spawn zig compiler {s}: {t}", .{ argv[0], err });
+    }) catch |err| {
+        gpa.free(zp.argv);
+        if (watch) gpa.destroy(zp);
+        return s.fail(maker, "failed to spawn zig compiler {s}: {t}", .{ argv[0], err });
+    };
 
     zp.multi_reader.init(gpa, io, zp.multi_reader_buffer.toStreams(), &.{
         zp.child.stdout.?, zp.child.stderr.?,
     });
     if (watch) s.extended.compile.zig_process = zp;
-    defer if (!watch) zp.deinit(io);
+    defer if (!watch) zp.deinit(gpa, io);
 
     const result = result: {
         defer if (watch) zp.saveState(prog_node);
@@ -836,7 +857,7 @@ fn setResultCacheStatus(s: *Step, man: *const Cache.Manifest, status: Cache.Mani
     return status == .hit;
 }
 
-fn clearResultCacheStatus(s: *Step, gpa: Allocator) void {
+pub fn clearResultCacheStatus(s: *Step, gpa: Allocator) void {
     switch (s.result_cache_status) {
         .hit, .incomplete_manifest, .invalid_manifest => {},
 

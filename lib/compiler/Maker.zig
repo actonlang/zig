@@ -77,6 +77,9 @@ initial_steps: std.array_hash_map.Auto(Configuration.Step.Index, void),
 /// Allocated into `gpa` during `prepare`.
 step_stack: std.array_hash_map.Auto(Configuration.Step.Index, void),
 pkg_config: PkgConfig,
+/// Snapshots at the explicit BSP publication boundary, indexed by configured step.
+bsp_previous: std.array_hash_map.Auto(Configuration.Step.Index, StepStamp) = .empty,
+bsp_current: std.array_hash_map.Auto(Configuration.Step.Index, StepStamp) = .empty,
 
 error_style: ErrorStyle,
 multiline_errors: MultilineErrors,
@@ -183,6 +186,301 @@ const GeneratedFile = struct {
         }
     }
 };
+
+const StepStamp = struct { inputs: u64, outputs: u64, check: bool = false, refresh_outputs: bool = false };
+
+/// Preserve successful steps across controlled build requests. Take every input
+/// snapshot before invalidating anything: reset clears the dependant inputs too.
+fn prepareRebuild(maker: *Maker) !void {
+    var scratch = std.heap.ArenaAllocator.init(maker.gpa);
+    defer scratch.deinit();
+    const arena = scratch.allocator();
+    var stamps: std.StringHashMapUnmanaged(u64) = .empty;
+    var existence_stamps: std.StringHashMapUnmanaged(u64) = .empty;
+    // Share complete input contributions within this publication boundary.
+    // Keep directory spelling and dependency strength intact.
+    var input_stamps: std.StringHashMapUnmanaged(std.StringHashMapUnmanaged([2]?u64)) = .empty;
+    maker.bsp_current.clearRetainingCapacity();
+    for (maker.step_stack.keys()) |index| {
+        var inputs: u64 = 0;
+        const step = maker.stepByIndex(index);
+        // These steps are rechecked independently of their input snapshots.
+        const check = switch (step.extended) {
+            .compile => try hasUntrackedNativeInputs(maker, arena, index, false),
+            .install_artifact, .install_file, .install_dir, .run, .update_source_files, .fmt, .check_file => true,
+            else => false,
+        };
+        if (check) {
+            try maker.bsp_current.put(maker.gpa, index, .{ .inputs = 0, .outputs = 0, .check = true });
+            continue;
+        }
+        for (step.inputs.table.keys(), step.inputs.table.values()) |dir, files| {
+            const directory = try dir.toString(arena);
+            const entry = try input_stamps.getOrPut(arena, directory);
+            if (!entry.found_existing) entry.value_ptr.* = .empty;
+            for (files.items) |file| {
+                const input = try entry.value_ptr.getOrPut(arena, file.basename);
+                if (!input.found_existing) input.value_ptr.* = .{ null, null };
+                const contribution = &input.value_ptr[@intFromBool(file.existence_only)];
+                if (contribution.* == null) {
+                    const path = try Dir.path.join(arena, &.{ directory, file.basename });
+                    var hash = std.hash.Wyhash.init(0);
+                    hash.update(path);
+                    std.hash.autoHash(&hash, file.existence_only);
+                    std.hash.autoHash(&hash, if (file.existence_only)
+                        try stampExistence(arena, maker.graph.io, path, &existence_stamps)
+                    else
+                        try stampPath(arena, maker.graph.io, path, &stamps));
+                    contribution.* = hash.final();
+                }
+                inputs +%= contribution.*.?;
+            }
+        }
+        try maker.bsp_current.put(maker.gpa, index, .{
+            .inputs = inputs,
+            .outputs = try stampOutputs(maker, arena, index, &stamps),
+        });
+    }
+    for (maker.step_stack.keys()) |index| {
+        const before = maker.bsp_previous.get(index) orelse continue;
+        const now = maker.bsp_current.get(index).?;
+        const step = maker.stepByIndex(index);
+        const retry = switch (step.state) {
+            .failure, .dependency_failure, .dependency_skipped, .skipped, .skipped_oom => true,
+            else => false,
+        };
+        if (before.inputs != now.inputs or before.outputs != now.outputs or retry or now.check) {
+            _ = maker.invalidateResult(step) catch unreachable;
+        } else if (step.state == .success) {
+            step.clearResultCacheStatus(maker.gpa);
+            step.result_cache_status = .hit;
+            step.result_duration_ns = null;
+        }
+    }
+    // A later dependency can invalidate a step visited earlier in the loop.
+    for (maker.bsp_current.keys(), maker.bsp_current.values()) |index, *stamp| {
+        stamp.refresh_outputs = maker.stepByIndex(index).state != .success;
+    }
+}
+
+pub fn hasNativeInputs(maker: *Maker, arena: Allocator, index: Configuration.Step.Index) !bool {
+    const conf = &maker.scanned_config.configuration;
+    const compile = index.ptr(conf).extended.get(conf.extra).compile;
+    // Only the old Mach-O linker refreshes C objects after prelink. Other
+    // linkers skip C updates in a retained compiler, including ELF executables.
+    // An unspecified Mach-O linker selects the new linker in incremental mode.
+    const refreshes_c_inputs = compile.flags2.use_llvm == .false and compile.flags3.kind == .exe and
+        compile.rootModuleTarget(conf).flags.object_format.unwrap() == .macho and
+        compile.flags2.use_lld != .true and compile.flags2.use_new_linker == .false;
+    if (refreshes_c_inputs) return hasUntrackedNativeInputs(maker, arena, index, false);
+    return hasUntrackedNativeInputs(maker, arena, index, true);
+}
+
+fn hasUntrackedNativeInputs(maker: *Maker, arena: Allocator, index: Configuration.Step.Index, include_c: bool) !bool {
+    // Requires compiler manifests and filesystem inputs containing both read
+    // headers and include-search observations. Assembly and resources remain
+    // conservative because those tools do not report the same dependency set.
+    const conf = &maker.scanned_config.configuration;
+    const compile = index.ptr(conf).extended.get(conf.extra).compile;
+    var modules: std.array_hash_map.Auto(Configuration.Module.Index, void) = .empty;
+    try modules.put(arena, compile.root_module, {});
+    var i: usize = 0;
+    while (i < modules.count()) : (i += 1) {
+        const module = modules.keys()[i].get(conf);
+        for (0..module.link_objects.len) |j| switch (module.link_objects.get(conf.extra, j)) {
+            .c_source_file => |source_index| {
+                if (include_c) return true;
+                const source = source_index.get(conf);
+                if (hasUntrackedLanguage(conf, source.flags.lang, source.args.slice)) return true;
+                const path = switch (source.file.get(conf)) {
+                    .source_path => |path| path.sub_path.slice(conf),
+                    .relative => |path| path.sub_path.slice(conf),
+                    .generated => |generated| blk: {
+                        // The first request precedes the producer. Later requests
+                        // can classify its existing path without running it again.
+                        _ = maker.generatedFile(generated.index).toPath(maker.graph) orelse return true;
+                        break :blk try maker.resolveLazyPathIndexAbs(arena, source.file, index);
+                    },
+                };
+                if (mem.endsWith(u8, path, ".s") or mem.endsWith(u8, path, ".S")) return true;
+            },
+            .c_source_files => |source_index| {
+                if (include_c) return true;
+                const source = source_index.get(conf);
+                if (hasUntrackedLanguage(conf, source.flags.lang, source.args.slice)) return true;
+                for (source.sub_paths.slice) |path| {
+                    const name = path.slice(conf);
+                    if (mem.endsWith(u8, name, ".s") or mem.endsWith(u8, name, ".S")) return true;
+                }
+            },
+            .assembly_file, .win32_resource_file => return true,
+            else => {},
+        };
+        for (module.import_table.get(conf).imports.mal.items(.module)) |import|
+            try modules.put(arena, import, {});
+    }
+    return false;
+}
+
+fn hasUntrackedLanguage(conf: *const Configuration, language: Configuration.OptionalCSourceLanguage, args: []const Configuration.String) bool {
+    if (language == .assembly or language == .assembly_with_preprocessor) return true;
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i].slice(conf);
+        if (mem.eql(u8, arg, "--language") or mem.startsWith(u8, arg, "--language=")) return true;
+        if (!mem.startsWith(u8, arg, "-x")) continue;
+        const value = if (arg.len == 2) blk: {
+            i += 1;
+            if (i == args.len) return true;
+            break :blk args[i].slice(conf);
+        } else arg[2..];
+        if (mem.eql(u8, value, "c") or mem.eql(u8, value, "c++") or
+            mem.eql(u8, value, "objective-c") or mem.eql(u8, value, "objective-c++") or
+            mem.eql(u8, value, "ir") or mem.eql(u8, value, "none")) continue;
+        return true;
+    }
+    return false;
+}
+
+fn finishRebuild(maker: *Maker) !void {
+    var scratch = std.heap.ArenaAllocator.init(maker.gpa);
+    defer scratch.deinit();
+    var stamps: std.StringHashMapUnmanaged(u64) = .empty;
+    for (maker.bsp_current.keys(), maker.bsp_current.values()) |index, *stamp| {
+        // Keep the pre-build input stamp. Newly discovered inputs, or inputs
+        // edited while a step runs, must be validated on the next request.
+        // Reused outputs keep their pre-build stamp. An external change during
+        // this build must invalidate their producer on the next request.
+        if (!stamp.check and stamp.refresh_outputs and maker.stepByIndex(index).state == .success)
+            stamp.outputs = try stampOutputs(maker, scratch.allocator(), index, &stamps);
+    }
+    std.mem.swap(@TypeOf(maker.bsp_previous), &maker.bsp_previous, &maker.bsp_current);
+}
+
+fn stampOutputs(maker: *Maker, arena: Allocator, index: Configuration.Step.Index, stamps: *std.StringHashMapUnmanaged(u64)) !u64 {
+    const Visitor = struct {
+        maker: *Maker,
+        arena: Allocator,
+        stamps: *std.StringHashMapUnmanaged(u64),
+        stamp: u64 = 0,
+        err: ?anyerror = null,
+
+        fn visit(this: *@This(), file_index: Configuration.GeneratedFileIndex) void {
+            if (this.err != null) return;
+            const path = this.maker.generatedFile(file_index).toPath(this.maker.graph) orelse return;
+            const absolute = path.toString(this.arena) catch |err| {
+                this.err = err;
+                return;
+            };
+            var hash = std.hash.Wyhash.init(0);
+            hash.update(absolute);
+            const stamp = stampPath(this.arena, this.maker.graph.io, absolute, this.stamps) catch |err| {
+                this.err = err;
+                return;
+            };
+            std.hash.autoHash(&hash, stamp);
+            this.stamp +%= hash.final();
+        }
+    };
+    var visitor: Visitor = .{ .maker = maker, .arena = arena, .stamps = stamps };
+    walkGeneratedFiles(index, &maker.scanned_config.configuration, *Visitor, &visitor);
+    if (visitor.err) |err| return err;
+    return visitor.stamp;
+}
+
+/// VFS lookup observations depend only on existence and kind. In particular,
+/// querying an SDK directory must not recursively hash its contents.
+fn stampExistence(arena: Allocator, io: Io, path: []const u8, stamps: *std.StringHashMapUnmanaged(u64)) !u64 {
+    if (stamps.get(path)) |stamp| return stamp;
+    const stat = Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => null,
+        else => return err,
+    };
+    const stamp = if (stat) |info| 1 + @as(u64, @backingInt(info.kind)) else 0;
+    try stamps.put(arena, try arena.dupe(u8, path), stamp);
+    return stamp;
+}
+
+test "existence snapshots ignore directory descendants and file contents" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_instance = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_instance.deinit();
+    const arena = arena_instance.allocator();
+    const path = try tmp.dir.realPathFileAlloc(io, ".", arena);
+    const candidate = try Dir.path.join(arena, &.{ path, "sdk" });
+    var stamps: std.StringHashMapUnmanaged(u64) = .empty;
+    try std.testing.expectEqual(0, try stampExistence(arena, io, candidate, &stamps));
+    try tmp.dir.createDirPath(io, "sdk/include/deep");
+    stamps.clearRetainingCapacity();
+    const directory = try stampExistence(arena, io, candidate, &stamps);
+    try std.testing.expect(directory != 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "sdk/include/deep/header.h", .data = "first" });
+    stamps.clearRetainingCapacity();
+    try std.testing.expectEqual(directory, try stampExistence(arena, io, candidate, &stamps));
+    try tmp.dir.writeFile(io, .{ .sub_path = "sdk/include/deep/header.h", .data = "different contents and length" });
+    stamps.clearRetainingCapacity();
+    try std.testing.expectEqual(directory, try stampExistence(arena, io, candidate, &stamps));
+    try tmp.dir.deleteTree(io, "sdk");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sdk", .data = "now a file" });
+    stamps.clearRetainingCapacity();
+    const file = try stampExistence(arena, io, candidate, &stamps);
+    try std.testing.expect(file != 0 and file != directory);
+    try tmp.dir.writeFile(io, .{ .sub_path = "sdk", .data = "updated file contents" });
+    stamps.clearRetainingCapacity();
+    try std.testing.expectEqual(file, try stampExistence(arena, io, candidate, &stamps));
+    try tmp.dir.deleteFile(io, "sdk");
+    stamps.clearRetainingCapacity();
+    try std.testing.expectEqual(0, try stampExistence(arena, io, candidate, &stamps));
+}
+
+fn stampPath(arena: Allocator, io: Io, path: []const u8, stamps: *std.StringHashMapUnmanaged(u64)) anyerror!u64 {
+    // Dependencies often share files and complete directory trees. Sample each
+    // top-level path once per boundary; recursive cycle handling stays local.
+    if (stamps.get(path)) |stamp| return stamp;
+    var ancestors: std.StringHashMapUnmanaged(void) = .empty;
+    defer ancestors.deinit(arena);
+    const stamp = try stampPathRecursive(arena, io, path, &ancestors);
+    try stamps.put(arena, try arena.dupe(u8, path), stamp);
+    return stamp;
+}
+
+fn stampPathRecursive(arena: Allocator, io: Io, path: []const u8, ancestors: *std.StringHashMapUnmanaged(void)) anyerror!u64 {
+    const link = Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return 0,
+        else => return err,
+    };
+    var hash = std.hash.Wyhash.init(0);
+    const stat = if (link.kind == .sym_link) blk: {
+        std.hash.autoHash(&hash, .{ link.inode, link.size, link.mtime.nanoseconds, link.ctime.nanoseconds, link.kind });
+        break :blk Dir.cwd().statFile(io, path, .{}) catch |err| switch (err) {
+            error.FileNotFound, error.NotDir => return hash.final(),
+            else => return err,
+        };
+    } else link;
+    std.hash.autoHash(&hash, .{ stat.inode, stat.size, stat.mtime.nanoseconds, stat.ctime.nanoseconds, stat.kind });
+    if (stat.kind == .directory) {
+        // A directory watch includes edits to existing descendants, not only
+        // changes to its entries. Follow links but stop ancestor cycles.
+        const canonical = try Dir.cwd().realPathFileAlloc(io, path, arena);
+        const entry = try ancestors.getOrPut(arena, canonical);
+        if (entry.found_existing) return hash.final();
+        defer _ = ancestors.remove(canonical);
+        var dir = try Dir.cwd().openDir(io, path, .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        var children: u64 = 0;
+        while (try it.next(io)) |child| {
+            var item = std.hash.Wyhash.init(0);
+            item.update(child.name);
+            std.hash.autoHash(&item, try stampPathRecursive(arena, io, try Dir.path.join(arena, &.{ path, child.name }), ancestors));
+            children +%= item.final();
+        }
+        std.hash.autoHash(&hash, children);
+    }
+    return hash.final();
+}
 
 /// Used to build the -M flags to pass to build-exe.
 pub const CliModule = struct {
@@ -929,6 +1227,11 @@ pub fn main(init: process.Init.Minimal) !void {
                                 defer gpa.free(steps);
                                 if (body.flags.watch and !Watch.have_impl) fatal("file watching is unavailable", .{});
 
+                                // The request is fully consumed, with no next read in flight.
+                                // Publish a fresh configuration before the client resubmits.
+                                if ((scanned_config.configuration.poisoned and maker.steps.len != 0) or
+                                    try configure_source_files.changed(&graph.cache)) continue :configure;
+
                                 try select.concurrent(.message, Server.receiveMessage, .{s});
 
                                 maker.watch = body.flags.watch;
@@ -941,6 +1244,7 @@ pub fn main(init: process.Init.Minimal) !void {
                                         process.exit(1);
                                     },
                                     error.LazyDependencyNeeded => continue :configure,
+                                    else => |e| return e,
                                 };
 
                                 try maker.makeSteps(main_progress_node, null);
@@ -1007,6 +1311,7 @@ pub fn main(init: process.Init.Minimal) !void {
                     process.exit(1);
                 },
                 error.LazyDependencyNeeded => continue :configure,
+                else => |e| return e,
             };
 
             var w: Watch = w: {
@@ -2671,7 +2976,10 @@ fn markFailedStepsDirty(maker: *Maker) void {
     for (all_steps) |step_index| {
         const step = maker.stepByIndex(step_index);
         switch (step.state) {
-            .success => step.result_cache_status = .hit,
+            .success => {
+                step.clearResultCacheStatus(maker.gpa);
+                step.result_cache_status = .hit;
+            },
             else => continue,
         }
     }
@@ -2721,7 +3029,7 @@ fn prepare(
     step_indices: []const Configuration.Step.Index,
     configure_source_files: *const Cache.Manifest.SelfContainedFiles,
     discovered_unlazy_set: *Fetch.JobQueue.UnlazySet,
-) error{ InsufficientMemory, OutOfMemory, DependencyLoopDetected, LazyDependencyNeeded }!void {
+) !void {
     const gpa = maker.gpa;
     const graph = maker.graph;
     const arena = graph.arena;
@@ -2730,44 +3038,57 @@ fn prepare(
     const step_stack = &maker.step_stack;
     const c = &maker.scanned_config.configuration;
 
-    // Extra step at the end which is the autogenerated placeholder
-    // step which indicates that we need to reconfigure.
-    maker.steps = try arena.alloc(Step, c.steps.len + 1);
-    maker.generated_files = try arena.alloc(GeneratedFile, c.generated_files_len);
-    @memset(maker.generated_files, .{ .data = null });
+    const same_steps = maker.steps.len != 0 and step_indices.len == initial_steps.count() and same: {
+        for (step_indices) |index| if (!initial_steps.contains(index)) break :same false;
+        break :same true;
+    };
+    if (!same_steps) {
+        maker.bsp_previous.clearRetainingCapacity();
+        maker.bsp_current.clearRetainingCapacity();
+        if (maker.steps.len == 0) {
+            // Keep configured steps and generated paths when a BSP client asks
+            // to rebuild the same configured graph.
+            maker.steps = try arena.alloc(Step, c.steps.len + 1);
+            maker.generated_files = try arena.alloc(GeneratedFile, c.generated_files_len);
+            @memset(maker.generated_files, .{ .data = null });
+            for (maker.steps[0 .. maker.steps.len - 1], 0..) |*step, step_index_usize| {
+                const step_index: Configuration.Step.Index = @fromBackingInt(@intCast(step_index_usize));
+                step.* = .{ .extended = .init(step_index.ptr(c).flags(c).tag) };
+            }
+            const last_step = &maker.steps[maker.steps.len - 1];
+            last_step.* = .{ .extended = .init(.top_level) };
+            try last_step.setWatchInputsFromManifestFiles(maker, configure_source_files, graph.cache.prefixes());
+        } else {
+            for (maker.steps[0 .. maker.steps.len - 1]) |*step| {
+                step.state = .precheck_done;
+                step.reset(maker);
+                step.state = .precheck_unstarted;
+                step.dependants.clearRetainingCapacity();
+            }
+        }
 
-    // The last element is a reserved special pseudostep which contains the
-    // watch inputs for the configurer executable.
-    for (maker.steps[0 .. maker.steps.len - 1], 0..) |*step, step_index_usize| {
-        const step_index: Configuration.Step.Index = @fromBackingInt(@intCast(step_index_usize));
-        step.* = .{ .extended = .init(step_index.ptr(c).flags(c).tag) };
+        try initial_steps.ensureUnusedCapacity(gpa, step_indices.len);
+        try step_stack.ensureUnusedCapacity(gpa, step_indices.len);
+
+        initial_steps.clearRetainingCapacity();
+        step_stack.clearRetainingCapacity();
+
+        for (step_indices) |step| {
+            initial_steps.putAssumeCapacity(step, {});
+            step_stack.putAssumeCapacity(step, {});
+        }
+
+        const starting_steps = try arena.dupe(Configuration.Step.Index, step_stack.keys());
+
+        var rng = std.Random.DefaultPrng.init(seed);
+        const rand = rng.random();
+        rand.shuffle(Configuration.Step.Index, starting_steps);
+
+        for (starting_steps) |s| {
+            try constructGraphAndCheckForDependencyLoop(maker, s, &maker.step_stack, rand);
+        }
     }
-    {
-        const last_step = &maker.steps[maker.steps.len - 1];
-        last_step.* = .{ .extended = .init(.top_level) };
-        try last_step.setWatchInputsFromManifestFiles(maker, configure_source_files, graph.cache.prefixes());
-    }
-
-    try initial_steps.ensureUnusedCapacity(gpa, step_indices.len);
-    try step_stack.ensureUnusedCapacity(gpa, step_indices.len);
-
-    initial_steps.clearRetainingCapacity();
-    step_stack.clearRetainingCapacity();
-
-    for (step_indices) |step| {
-        initial_steps.putAssumeCapacity(step, {});
-        step_stack.putAssumeCapacity(step, {});
-    }
-
-    const starting_steps = try arena.dupe(Configuration.Step.Index, step_stack.keys());
-
-    var rng = std.Random.DefaultPrng.init(seed);
-    const rand = rng.random();
-    rand.shuffle(Configuration.Step.Index, starting_steps);
-
-    for (starting_steps) |s| {
-        try constructGraphAndCheckForDependencyLoop(maker, s, &maker.step_stack, rand);
-    }
+    if (maker.protocol_server != null) try maker.prepareRebuild();
 
     // Notice when a step's participation in the evaluation graph implies that additional package dependencies
     // must be fetched.
@@ -2885,9 +3206,7 @@ fn makeSteps(
         ws.finishBuild(.{ .fuzz = fuzz != null });
     }
 
-    if (maker.protocol_server) |s| {
-        try s.serveBodylessMessage(.bsp_build_completed);
-    }
+    if (maker.protocol_server != null) try maker.finishRebuild();
 
     assert(maker.memory_blocked_steps.items.len == 0);
 
@@ -2975,6 +3294,8 @@ fn makeSteps(
         std.Progress.setStatus(.failure);
     }
 
+    var summary_buffer: Io.Writer.Allocating = .init(gpa);
+    defer summary_buffer.deinit();
     summary: {
         switch (maker.summary) {
             .all, .new, .line => {},
@@ -2982,10 +3303,16 @@ fn makeSteps(
             .none => break :summary,
         }
 
-        const stderr = try io.lockStderr(&stdio_buffer_allocation, graph.stderr_mode);
-        defer io.unlockStderr();
-        const t = stderr.terminal();
-        const w = &stderr.file_writer.interface;
+        const stderr = if (maker.protocol_server == null)
+            try io.lockStderr(&stdio_buffer_allocation, graph.stderr_mode)
+        else
+            null;
+        defer if (stderr != null) io.unlockStderr();
+        const t: Io.Terminal = if (stderr) |stream| stream.terminal() else .{
+            .writer = &summary_buffer.writer,
+            .mode = .no_color,
+        };
+        const w = t.writer;
 
         const total_count = success_count + failure_count + pending_count + skipped_count;
         t.setColor(.cyan) catch {};
@@ -3074,6 +3401,19 @@ fn makeSteps(
         w.writeByte('\n') catch {};
     }
 
+    if (maker.protocol_server) |s| {
+        // Keep diagnostics and completion in one ordered stream. Stderr may
+        // otherwise be read by the client only after the next request starts.
+        if (summary_buffer.written().len != 0) {
+            var errors = try std.zig.ErrorBundle.Wip.init(gpa);
+            defer errors.deinit();
+            var bundle = try errors.toOwnedBundle(summary_buffer.written());
+            defer bundle.deinit(gpa);
+            try s.serveErrorBundle(.error_bundle, bundle);
+        }
+        try s.serveBodylessMessage(.bsp_build_completed);
+    }
+
     if (maker.watch or maker.web_server != null or maker.protocol_server != null) return;
 
     const code: u8 = code: {
@@ -3097,6 +3437,8 @@ fn deinit(maker: *Maker) void {
     maker.memory_blocked_steps.deinit(gpa);
     maker.initial_steps.deinit(gpa);
     maker.step_stack.deinit(gpa);
+    maker.bsp_previous.deinit(gpa);
+    maker.bsp_current.deinit(gpa);
 }
 
 fn stepReady(
@@ -3824,7 +4166,37 @@ fn serveBuildStepCompleted(
     s: *Server,
 ) !void {
     const step = maker.stepByIndex(step_index);
-    const error_bundle = step.result_error_bundle;
+    // Build failures such as failed commands and explicit Fail steps do not
+    // populate the compiler ErrorBundle. Include their diagnostics in BSP too.
+    var generic_errors: std.zig.ErrorBundle = .empty;
+    defer generic_errors.deinit(maker.gpa);
+    if ((status == .failure or status == .skipped_oom) and
+        step.result_error_bundle.errorMessageCount() == 0 and
+        (step.result_error_msgs.items.len != 0 or step.result_stderr.len != 0))
+    {
+        var errors = try std.zig.ErrorBundle.Wip.init(maker.gpa);
+        defer errors.deinit();
+        for (step.result_error_msgs.items) |message|
+            try errors.addRootErrorMessage(.{ .msg = try errors.addString(message) });
+        if (step.result_stderr.len != 0)
+            try errors.addRootErrorMessage(.{ .msg = try errors.addString(step.result_stderr) });
+        generic_errors = try errors.toOwnedBundle("");
+    }
+    // Carry successful stderr synchronously as log text, without error roots.
+    if (status == .success and step.result_stderr.len != 0) {
+        var errors = try std.zig.ErrorBundle.Wip.init(maker.gpa);
+        defer errors.deinit();
+        const existing = step.result_error_bundle;
+        if (existing.extra.len != 0) try errors.addBundleAsRoots(existing);
+        const old_log = if (existing.extra.len == 0) "" else existing.getCompileLogOutput();
+        const log_text = try mem.concat(maker.gpa, u8, &.{ old_log, step.result_stderr });
+        defer maker.gpa.free(log_text);
+        generic_errors = try errors.toOwnedBundle(log_text);
+    }
+    const error_bundle = if (generic_errors.extra.len != 0)
+        generic_errors
+    else
+        step.result_error_bundle;
 
     const gf_size = countGeneratedFiles(maker.generated_files, step_index, &maker.scanned_config.configuration);
 
@@ -4789,11 +5161,15 @@ fn confPathDepToCachePath(
             .root_dir = graph.global_cache_root,
             .sub_path = sub_path,
         },
-        .build_root => .{
-            .root_dir = graph.build_root_directory,
-            .sub_path = switch (path_dep.pkg.unwrap().?) {
-                .root => sub_path,
-                else => |index| try Dir.path.join(arena, &.{ index.get(c).?.root_path.slice(c), sub_path }),
+        .build_root => switch (path_dep.pkg.unwrap().?) {
+            .root => .{
+                .root_dir = graph.build_root_directory,
+                .sub_path = sub_path,
+            },
+            else => |index| .{
+                // Package roots are relative to cwd, as in packagePath.
+                .root_dir = .cwd(),
+                .sub_path = try Dir.path.join(arena, &.{ index.get(c).?.root_path.slice(c), sub_path }),
             },
         },
         .zig_exe => {
