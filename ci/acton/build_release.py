@@ -79,10 +79,14 @@ def main():
     dirty = subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=source, text=True)
     if dirty:
         parser.error('Release source tree has tracked modifications')
+    notices = output / 'third-party-notices'
+    shutil.copytree(Path(__file__).with_name('notices'), notices)
     provenance = {'version': version, 'source_commit': revision, 'target': target,
                   'bootstrap': metadata['bootstrap_compiler'], 'llvm_kit': kit_identity,
                   'inputs_sha256': digest(metadata_path), 'recipe_sha256': digest(Path(__file__)),
                   'binary_sha256': digest(output / 'zig'),
+                  'notices_sha256': {str(p.relative_to(output)): digest(p)
+                    for p in sorted(notices.rglob('*')) if p.is_file()},
                   'library_sha256': {str(p.relative_to(output)): digest(p)
                     for p in sorted((output / 'lib').rglob('*')) if p.is_file()}}
     (output / 'provenance.json').write_text(json.dumps(provenance, indent=2) + '\n')

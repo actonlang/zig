@@ -1,0 +1,308 @@
+[
+  {
+    "file": "LLVM.txt",
+    "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee",
+    "source_selection": "whole file",
+    "sources": [
+      {
+        "version": "23.1.2",
+        "path": "llvm/LICENSE.TXT",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.2/llvm/LICENSE.TXT",
+        "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee",
+        "first_line": 1,
+        "last_line": 279
+      },
+      {
+        "version": "23.1.4",
+        "path": "llvm/LICENSE.TXT",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.4/llvm/LICENSE.TXT",
+        "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee",
+        "first_line": 1,
+        "last_line": 279
+      }
+    ]
+  },
+  {
+    "file": "CLANG.txt",
+    "sha256": "ebcd9bbf783a73d05c53ba4d586b8d5813dcdf3bbec50265860ccc885e606f47",
+    "source_selection": "whole file",
+    "sources": [
+      {
+        "version": "23.1.2",
+        "path": "clang/LICENSE.TXT",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.2/clang/LICENSE.TXT",
+        "sha256": "ebcd9bbf783a73d05c53ba4d586b8d5813dcdf3bbec50265860ccc885e606f47",
+        "first_line": 1,
+        "last_line": 278
+      },
+      {
+        "version": "23.1.4",
+        "path": "clang/LICENSE.TXT",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.4/clang/LICENSE.TXT",
+        "sha256": "ebcd9bbf783a73d05c53ba4d586b8d5813dcdf3bbec50265860ccc885e606f47",
+        "first_line": 1,
+        "last_line": 278
+      }
+    ]
+  },
+  {
+    "file": "LLD.txt",
+    "sha256": "f7891568956e34643eb6a0db1462db30820d40d7266e2a78063f2fe233ece5a0",
+    "source_selection": "whole file",
+    "sources": [
+      {
+        "version": "23.1.2",
+        "path": "lld/LICENSE.TXT",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.2/lld/LICENSE.TXT",
+        "sha256": "f7891568956e34643eb6a0db1462db30820d40d7266e2a78063f2fe233ece5a0",
+        "first_line": 1,
+        "last_line": 278
+      },
+      {
+        "version": "23.1.4",
+        "path": "lld/LICENSE.TXT",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.4/lld/LICENSE.TXT",
+        "sha256": "f7891568956e34643eb6a0db1462db30820d40d7266e2a78063f2fe233ece5a0",
+        "first_line": 1,
+        "last_line": 278
+      }
+    ]
+  },
+  {
+    "file": "LLVM-BLAKE3.txt",
+    "sha256": "6a94bedb8b707ed97f6e310d0d015ab14e0683ffa0a612b02958581b9cc9fc0e",
+    "source_selection": "whole file",
+    "sources": [
+      {
+        "version": "23.1.2",
+        "path": "llvm/lib/Support/BLAKE3/LICENSE",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.2/llvm/lib/Support/BLAKE3/LICENSE",
+        "sha256": "6a94bedb8b707ed97f6e310d0d015ab14e0683ffa0a612b02958581b9cc9fc0e",
+        "first_line": 1,
+        "last_line": 330
+      },
+      {
+        "version": "23.1.4",
+        "path": "llvm/lib/Support/BLAKE3/LICENSE",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.4/llvm/lib/Support/BLAKE3/LICENSE",
+        "sha256": "6a94bedb8b707ed97f6e310d0d015ab14e0683ffa0a612b02958581b9cc9fc0e",
+        "first_line": 1,
+        "last_line": 330
+      }
+    ]
+  },
+  {
+    "file": "LLVM-regex.txt",
+    "sha256": "0424e57d4303164dc59a8509c20dae0518b853692e5c2b0e98b11816fdbc97c7",
+    "source_selection": "whole file",
+    "sources": [
+      {
+        "version": "23.1.2",
+        "path": "llvm/lib/Support/COPYRIGHT.regex",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.2/llvm/lib/Support/COPYRIGHT.regex",
+        "sha256": "0424e57d4303164dc59a8509c20dae0518b853692e5c2b0e98b11816fdbc97c7",
+        "first_line": 1,
+        "last_line": 54
+      },
+      {
+        "version": "23.1.4",
+        "path": "llvm/lib/Support/COPYRIGHT.regex",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.4/llvm/lib/Support/COPYRIGHT.regex",
+        "sha256": "0424e57d4303164dc59a8509c20dae0518b853692e5c2b0e98b11816fdbc97c7",
+        "first_line": 1,
+        "last_line": 54
+      }
+    ]
+  },
+  {
+    "file": "LLVM-strlcpy.txt",
+    "sha256": "f9c6f4386edbba118287f5c7689aaf63eb4e407c3011314731348052c67d255e",
+    "source_selection": "verbatim comment block",
+    "sources": [
+      {
+        "version": "23.1.2",
+        "path": "llvm/lib/Support/regstrlcpy.c",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.2/llvm/lib/Support/regstrlcpy.c",
+        "sha256": "b717e3355fdca040c161a7a179de9db1c9253da6519e60b77a074cbf5f7d423f",
+        "first_line": 1,
+        "last_line": 17
+      },
+      {
+        "version": "23.1.4",
+        "path": "llvm/lib/Support/regstrlcpy.c",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.4/llvm/lib/Support/regstrlcpy.c",
+        "sha256": "b717e3355fdca040c161a7a179de9db1c9253da6519e60b77a074cbf5f7d423f",
+        "first_line": 1,
+        "last_line": 17
+      }
+    ]
+  },
+  {
+    "file": "LLVM-xxHash-source.txt",
+    "sha256": "4eca3924b5c7daab59e93307726c44b21de2de1b0df21acf0f6a62f48f149891",
+    "source_selection": "verbatim comment block",
+    "sources": [
+      {
+        "version": "23.1.2",
+        "path": "llvm/lib/Support/xxhash.cpp",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.2/llvm/lib/Support/xxhash.cpp",
+        "sha256": "699389b388a56d0caf330bb872739b2e23d51a22b7e2f758f2c11fac9936752d",
+        "first_line": 1,
+        "last_line": 33
+      },
+      {
+        "version": "23.1.4",
+        "path": "llvm/lib/Support/xxhash.cpp",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.4/llvm/lib/Support/xxhash.cpp",
+        "sha256": "699389b388a56d0caf330bb872739b2e23d51a22b7e2f758f2c11fac9936752d",
+        "first_line": 1,
+        "last_line": 33
+      }
+    ]
+  },
+  {
+    "file": "LLVM-xxHash-header.txt",
+    "sha256": "07ab483e553e0d2e5e03480127bce6d80db2d94a8411171785c875affc5cdfa9",
+    "source_selection": "verbatim comment block",
+    "sources": [
+      {
+        "version": "23.1.2",
+        "path": "llvm/include/llvm/Support/xxhash.h",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.2/llvm/include/llvm/Support/xxhash.h",
+        "sha256": "2a5c9e06ca8ad4cbd4d0da6ba4c135e11626bf369be1490769d7bee9499c4b4b",
+        "first_line": 1,
+        "last_line": 33
+      },
+      {
+        "version": "23.1.4",
+        "path": "llvm/include/llvm/Support/xxhash.h",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.4/llvm/include/llvm/Support/xxhash.h",
+        "sha256": "2a5c9e06ca8ad4cbd4d0da6ba4c135e11626bf369be1490769d7bee9499c4b4b",
+        "first_line": 1,
+        "last_line": 33
+      }
+    ]
+  },
+  {
+    "file": "LLVM-Unicode-conversion.txt",
+    "sha256": "2355f8ab91787f152998ecaef1744356a22b98ac80d6babaf95e3de99d7c7d25",
+    "source_selection": "verbatim comment block",
+    "sources": [
+      {
+        "version": "23.1.2",
+        "path": "llvm/lib/Support/ConvertUTF.cpp",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.2/llvm/lib/Support/ConvertUTF.cpp",
+        "sha256": "bdbbdf159f5dda86bf70faa4be49f810a01c9e4c4f866889aedf2eec1efcd798",
+        "first_line": 8,
+        "last_line": 44
+      },
+      {
+        "version": "23.1.2",
+        "path": "llvm/include/llvm/Support/ConvertUTF.h",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.2/llvm/include/llvm/Support/ConvertUTF.h",
+        "sha256": "ec95a5b9bd32ebebde9c780833bdfc089f473ba9e9d1d7a6e0e3320b13f57c0e",
+        "first_line": 8,
+        "last_line": 44
+      },
+      {
+        "version": "23.1.4",
+        "path": "llvm/lib/Support/ConvertUTF.cpp",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.4/llvm/lib/Support/ConvertUTF.cpp",
+        "sha256": "bdbbdf159f5dda86bf70faa4be49f810a01c9e4c4f866889aedf2eec1efcd798",
+        "first_line": 8,
+        "last_line": 44
+      },
+      {
+        "version": "23.1.4",
+        "path": "llvm/include/llvm/Support/ConvertUTF.h",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.4/llvm/include/llvm/Support/ConvertUTF.h",
+        "sha256": "ec95a5b9bd32ebebde9c780833bdfc089f473ba9e9d1d7a6e0e3320b13f57c0e",
+        "first_line": 8,
+        "last_line": 44
+      }
+    ]
+  },
+  {
+    "file": "LLVM-Unicode-names.txt",
+    "sha256": "75d279526d16d52e1d71bb89cec8a5b43b3642d5ea9c75f24538f6e1338d3e5a",
+    "source_selection": "verbatim comment block",
+    "sources": [
+      {
+        "version": "23.1.2",
+        "path": "llvm/lib/Support/UnicodeNameToCodepointGenerated.cpp",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.2/llvm/lib/Support/UnicodeNameToCodepointGenerated.cpp",
+        "sha256": "36d0880990bab4f512d943df0225080c1cd68d7c5721da2f50fac7346083e48c",
+        "first_line": 16,
+        "last_line": 63
+      },
+      {
+        "version": "23.1.4",
+        "path": "llvm/lib/Support/UnicodeNameToCodepointGenerated.cpp",
+        "url": "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-23.1.4/llvm/lib/Support/UnicodeNameToCodepointGenerated.cpp",
+        "sha256": "36d0880990bab4f512d943df0225080c1cd68d7c5721da2f50fac7346083e48c",
+        "first_line": 16,
+        "last_line": 63
+      }
+    ]
+  },
+  {
+    "file": "Zstandard.txt",
+    "sha256": "2c1a7fa704df8f3a606f6fc010b8b5aaebf403f3aeec339a12048f1ba7331a0b",
+    "source_selection": "whole file",
+    "sources": [
+      {
+        "version": "zstd-1.5.2",
+        "path": "LICENSE",
+        "url": "https://raw.githubusercontent.com/facebook/zstd/v1.5.2/LICENSE",
+        "sha256": "2c1a7fa704df8f3a606f6fc010b8b5aaebf403f3aeec339a12048f1ba7331a0b",
+        "first_line": 1,
+        "last_line": 30
+      }
+    ]
+  },
+  {
+    "file": "Zstandard-divsufsort.txt",
+    "sha256": "49ea9487741f926c49d0e6a4da9ffde7e315d413f5f823830acd743fdedb2afa",
+    "source_selection": "verbatim comment block",
+    "sources": [
+      {
+        "version": "zstd-1.5.2",
+        "path": "lib/dictBuilder/divsufsort.c",
+        "url": "https://raw.githubusercontent.com/facebook/zstd/v1.5.2/lib/dictBuilder/divsufsort.c",
+        "sha256": "2081acb08865f623857d2c0dcb0e79fce9489f01416528c30cfee7097915c616",
+        "first_line": 1,
+        "last_line": 25
+      }
+    ]
+  },
+  {
+    "file": "Zstandard-xxHash.txt",
+    "sha256": "a9df873684364c8233a49d741a54134880fb496bde956d4ee0737a35059460e2",
+    "source_selection": "verbatim comment block",
+    "sources": [
+      {
+        "version": "zstd-1.5.2",
+        "path": "lib/common/xxhash.h",
+        "url": "https://raw.githubusercontent.com/facebook/zstd/v1.5.2/lib/common/xxhash.h",
+        "sha256": "ed2cb8ccd85404211edc570946ff21cb98281a8aa26c98246918ea0ddbe9f0ec",
+        "first_line": 1,
+        "last_line": 13
+      }
+    ]
+  },
+  {
+    "file": "zlib.txt",
+    "sha256": "845efc77857d485d91fb3e0b884aaa929368c717ae8186b66fe1ed2495753243",
+    "source_selection": "whole file",
+    "sources": [
+      {
+        "version": "zlib-1.3.1",
+        "path": "LICENSE",
+        "url": "https://raw.githubusercontent.com/madler/zlib/v1.3.1/LICENSE",
+        "sha256": "845efc77857d485d91fb3e0b884aaa929368c717ae8186b66fe1ed2495753243",
+        "first_line": 1,
+        "last_line": 22
+      }
+    ]
+  }
+]

@@ -136,6 +136,15 @@ def check_provenance(root, source, expected_version):
     actual = {p.relative_to(root).as_posix(): sha256(p)
               for p in sorted((root / "lib").rglob("*")) if p.is_file()}
     require(library == actual, "provenance library manifest differs from packaged lib/")
+    notices = provenance.get("notices_sha256")
+    require(isinstance(notices, dict) and notices, "provenance must contain redistribution notice hashes")
+    actual_notices = {p.relative_to(root).as_posix(): sha256(p)
+                     for p in sorted((root / "third-party-notices").rglob("*")) if p.is_file()}
+    require(notices == actual_notices, "redistribution notices differ from provenance")
+    if source:
+        expected_notices = {"third-party-notices/" + p.relative_to(source / "ci/acton/notices").as_posix(): sha256(p)
+                            for p in sorted((source / "ci/acton/notices").rglob("*")) if p.is_file()}
+        require(notices == expected_notices, "redistribution notices differ from --source checkout")
     commit = provenance.get("source_commit", "")
     require(re.fullmatch(r"[0-9a-f]{40}", commit) is not None, "invalid provenance source commit")
     if source:
