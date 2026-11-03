@@ -16898,3 +16898,18 @@ void c_check_extern_offsets(void) {
     assert_or_panic(c_extern_offset_table.second == 31);
     assert_or_panic(zig_extern_offset_second() == 31);
 }
+
+struct SpilledSretResult { uint64_t tag, first, second; };
+extern struct SpilledSretResult zig_spilled_sret(void);
+uint64_t c_sret_value(uint64_t value) {
+#if defined(__aarch64__)
+    __asm__ volatile("mov x8, #1" ::: "x8");
+#endif
+    return value;
+}
+void c_check_spilled_sret(void) {
+    struct SpilledSretResult r = zig_spilled_sret();
+    assert_or_panic(r.tag == 2);
+    assert_or_panic(r.first == 276);
+    assert_or_panic(r.second == 10);
+}
