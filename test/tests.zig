@@ -2959,8 +2959,8 @@ pub fn addCAbiTests(b: *std.Build, options: CAbiTestOptions) *Step {
                 .pic = c_abi_target.pic,
                 .strip = c_abi_target.strip,
             });
-            test_mod.addCSourceFile(.{
-                .file = b.path("test/c_abi/cfuncs.c"),
+            test_mod.addCSourceFiles(.{
+                .files = &.{ "test/c_abi/cfuncs.c", "test/c_abi/regressions.c" },
                 .flags = &.{"-std=c99"},
             });
             for (c_abi_target.c_defines) |define| test_mod.addCMacro(define, "1");

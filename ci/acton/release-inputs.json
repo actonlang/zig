@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "bootstrap_version": "0.18.0-dev.852+efa5bfa9b",
+  "llvm_version": "23.1.4",
+  "bootstrap_source": {
+    "url": "https://ziglang.org/builds/zig-bootstrap-0.18.0-dev.852+efa5bfa9b.tar.xz",
+    "sha256": "b46a68cf7ecc7f37e179229245eca063260d9ab0189aa9327020a8ec679f85c3",
+    "size": 63313544
+  },
+  "bootstrap_compiler": {
+    "url": "https://ziglang.org/builds/zig-x86_64-linux-0.18.0-dev.852+efa5bfa9b.tar.xz",
+    "sha256": "d2850db8e6ee91bf2c0f19b3354a8de99fa3f3198b4dea157e95a06800fd0abf",
+    "size": 59234388
+  },
+  "devkit_version": "0.18.0-dev.92+1e1964473",
+  "devkits": {
+    "x86_64-linux-musl": {
+      "url": "https://ziglang.org/deps/zig+llvm+lld+clang-x86_64-linux-musl-0.18.0-dev.92+1e1964473.tar.xz",
+      "sha256": "3d59a8b9ac5ed3c1a046e550f35b5fb89cb5cd5ebf177cdf1ca00ad8150994e1",
+      "size": 160471708,
+      "llvm_version": "23.1.2"
+    },
+    "aarch64-linux-musl": {
+      "url": "https://ziglang.org/deps/zig+llvm+lld+clang-aarch64-linux-musl-0.18.0-dev.92+1e1964473.tar.xz",
+      "sha256": "c25acb7e17486303fdcb9e9a19e252c8dacf0575404ef1e97f508db9cb1d9965",
+      "size": 145959664,
+      "llvm_version": "23.1.2"
+    },
+    "aarch64-macos-none": {
+      "url": "https://ziglang.org/deps/zig+llvm+lld+clang-aarch64-macos-none-0.18.0-dev.92+1e1964473.tar.xz",
+      "sha256": "5daddeaad6e135ae4bd09d6c2b4c5a30873b58d10671c13fb8ac1af246df05e6",
+      "size": 143163856,
+      "llvm_version": "23.1.2"
+    }
+  },
+  "built_devkit": {
+    "target": "x86_64-macos-none",
+    "cpu": "baseline",
+    "name": "llvm-clang-lld-x86_64-macos-none-23.1.4-bootstrap-0.18.0-dev.852+efa5bfa9b",
+    "note": "Built once from the pinned bootstrap source; archive SHA256 is recorded after CI build, not predicted."
+  }
+}

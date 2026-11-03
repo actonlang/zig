@@ -16,3 +16,10 @@ zig-out/
 /build/
 /build-*/
 /docgen_tmp/
+
+# Acton release build workspaces.
+/release-work/
+/llvm-kit/
+/packages/
+/host-work/
+/host-bootstrap/
