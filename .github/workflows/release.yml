@@ -1,0 +1,182 @@
+name: Release builds
+
+on:
+  push:
+    branches: [zig-release]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the tested packages as an immutable release
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'workflow_dispatch' }}
+
+jobs:
+  llvm-intel-macos:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        id: llvm-cache
+        with:
+          path: |
+            llvm-kit/*.tar.xz
+            llvm-kit/*.tar.xz.sha256
+          key: intel-macos-llvm-${{ hashFiles('ci/acton/release-inputs.json', 'ci/acton/build_llvm.py', 'ci/acton/common.py') }}
+      - name: Build the static Intel macOS LLVM kit
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          python3 ci/acton/build_llvm.py --work-dir llvm-kit --jobs 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: llvm-intel-macos
+          path: |
+            llvm-kit/*.tar.xz
+            llvm-kit/*.tar.xz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux-musl, aarch64-linux-musl, aarch64-macos-none]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830
+        with:
+          path: release-work/downloads
+          key: release-inputs-${{ matrix.target }}-${{ hashFiles('ci/acton/release-inputs.json') }}
+      - name: Build a static compiler and its matching library
+        run: python3 ci/acton/build_release.py --target '${{ matrix.target }}' --work-dir release-work --jobs 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: package-${{ matrix.target }}
+          path: |
+            release-work/zig-*.tar.xz
+            release-work/zig-*.tar.xz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  build-intel-macos:
+    needs: llvm-intel-macos
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: llvm-intel-macos
+          path: llvm-kit
+      - name: Verify and extract the static LLVM kit
+        run: |
+          cd llvm-kit
+          sha256sum -c *.sha256
+          tar -xJf *.tar.xz
+      - name: Build the Intel macOS compiler
+        run: |
+          kit=$(python3 -c 'import json; print(json.load(open("ci/acton/release-inputs.json"))["built_devkit"]["name"])')
+          python3 ci/acton/build_release.py --target x86_64-macos-none --llvm-kit "llvm-kit/$kit" --work-dir release-work --jobs 2
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: package-x86_64-macos-none
+          path: |
+            release-work/zig-*.tar.xz
+            release-work/zig-*.tar.xz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-macos-none
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: package-${{ matrix.target }}
+          path: packages
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+      - name: Check the archive and run it after relocation
+        run: python3 ci/acton/test-release.py --archive packages/zig-*.tar.xz --version "$(cat ci/acton/version)" --source "$PWD" --output "${{ runner.temp }}/release-check"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: checks-${{ runner.arch }}-${{ runner.os }}
+          path: |
+            ${{ runner.temp }}/release-check/*.log
+            ${{ runner.temp }}/release-check/results.json
+          if-no-files-found: ignore
+
+  test-intel-macos:
+    needs: build-intel-macos
+    runs-on: macos-15-intel
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: package-x86_64-macos-none
+          path: packages
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: "3.13"
+      - name: Check the archive and run it after relocation
+        run: python3 ci/acton/test-release.py --archive packages/zig-*.tar.xz --version "$(cat ci/acton/version)" --source "$PWD" --output "${{ runner.temp }}/release-check"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: checks-${{ runner.arch }}-${{ runner.os }}
+          path: |
+            ${{ runner.temp }}/release-check/*.log
+            ${{ runner.temp }}/release-check/results.json
+          if-no-files-found: ignore
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.repository == 'actonlang/zig' && github.ref == 'refs/heads/zig-release'
+    needs: [test, test-intel-macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: package-*
+          path: packages
+          merge-multiple: true
+      - name: Publish the complete tested release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 ci/acton/publish.py packages
