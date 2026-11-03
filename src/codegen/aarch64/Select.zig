@@ -10939,14 +10939,25 @@ pub const Value = struct {
                                                 try isel.emit(.adr(mat.ra.x(), 0));
                                             },
                                             true => {
+                                                const is_extern = ip.getNav(nav).getExtern(ip) != null;
+                                                if (is_extern and ptr.byte_offset != 0) {
+                                                    if (std.math.cast(u12, ptr.byte_offset)) |immediate| {
+                                                        try isel.emit(.add(mat.ra.x(), mat.ra.x(), .{ .immediate = immediate }));
+                                                    } else {
+                                                        const offset_ra = try isel.allocIntReg();
+                                                        defer isel.freeReg(offset_ra);
+                                                        try isel.emit(.add(mat.ra.x(), mat.ra.x(), .{ .register = offset_ra.x() }));
+                                                        try isel.movImmediate(offset_ra.x(), ptr.byte_offset);
+                                                    }
+                                                }
                                                 try isel.nav_relocs.append(zcu.gpa, .{
                                                     .nav = nav,
                                                     .reloc = .{
                                                         .label = @intCast(isel.instructions.items.len),
-                                                        .addend = ptr.byte_offset,
+                                                        .addend = if (is_extern) 0 else ptr.byte_offset,
                                                     },
                                                 });
-                                                if (ip.getNav(nav).getExtern(ip)) |_|
+                                                if (is_extern)
                                                     try isel.emit(.ldr(mat.ra.x(), .{ .unsigned_offset = .{ .base = mat.ra.x(), .offset = 0 } }))
                                                 else
                                                     try isel.emit(.add(mat.ra.x(), mat.ra.x(), .{ .immediate = 0 }));
@@ -10954,7 +10965,7 @@ pub const Value = struct {
                                                     .nav = nav,
                                                     .reloc = .{
                                                         .label = @intCast(isel.instructions.items.len),
-                                                        .addend = ptr.byte_offset,
+                                                        .addend = if (is_extern) 0 else ptr.byte_offset,
                                                     },
                                                 });
                                                 try isel.emit(.adrp(mat.ra.x(), 0));
