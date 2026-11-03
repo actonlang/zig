@@ -3,6 +3,9 @@
     .fingerprint = 0xc0dbdf9c3b92810b,
     .version = "0.0.0",
     .dependencies = .{
+        .aarch64_slice_field = .{
+            .path = "aarch64_slice_field",
+        },
         .c_runtime_rebuild = .{
             .path = "c_runtime_rebuild",
         },
