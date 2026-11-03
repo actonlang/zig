@@ -18,7 +18,7 @@ TARGET = 'x86_64-linux-musl'
 
 def cmake_command(source, build, zig, llvm, version, wrappers):
     return ['cmake', '-S', str(source), '-B', str(build), '-G', 'Ninja',
-            '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_SYSTEM_NAME=Linux',
+            '-DCMAKE_BUILD_TYPE=Release',
             '-DCMAKE_PREFIX_PATH=' + str(llvm),
             '-DCMAKE_C_COMPILER=' + str(zig) + ';cc;-target;' + TARGET + ';-mcpu=baseline',
             '-DCMAKE_CXX_COMPILER=' + str(zig) + ';c++;-target;' + TARGET + ';-mcpu=baseline',
