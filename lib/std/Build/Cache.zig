@@ -3235,20 +3235,22 @@ fn testDepFileLogicalPath(absolute: bool) !void {
     cache.addPrefix(.{ .path = null, .handle = Io.Dir.cwd() });
     cache.addPrefix(directory);
     defer cache.manifest_dir.close(io);
-    try tmp.dir.createDirPath(io, "include");
+    try tmp.dir.createDirPath(io, "include path");
     try tmp.dir.createDirPath(io, "target/nested");
-    try tmp.dir.writeFile(io, .{ .sub_path = "include/value.h", .data = "unchanged lexical sentinel" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "include path/value.h", .data = "unchanged lexical sentinel" });
     try tmp.dir.writeFile(io, .{ .sub_path = "target/value.h", .data = "actual header" });
-    tmp.dir.symLink(io, "../target/nested", "include/link", .{ .is_directory = true }) catch |err| switch (err) {
+    tmp.dir.symLink(io, "../target/nested", "include path/link", .{ .is_directory = true }) catch |err| switch (err) {
         error.AccessDenied, error.PermissionDenied, error.FileSystem => if (builtin.os.tag == .windows) return error.SkipZigTest else return err,
         else => return err,
     };
     const prerequisite = if (absolute)
-        try std.fs.path.join(testing.allocator, &.{ tmp_path, "include/link/../value.h" })
+        try std.fs.path.join(testing.allocator, &.{ tmp_path, "include path/link/../value.h" })
     else
-        try testing.allocator.dupe(u8, "include/link/../value.h");
+        try testing.allocator.dupe(u8, "include path/link/../value.h");
     defer testing.allocator.free(prerequisite);
-    const depfile = try std.fmt.allocPrint(testing.allocator, "object.o: {s}\n", .{prerequisite});
+    const escaped = try mem.replaceOwned(u8, testing.allocator, prerequisite, " ", "\\ ");
+    defer testing.allocator.free(escaped);
+    const depfile = try std.fmt.allocPrint(testing.allocator, "object.o: {s}\n", .{escaped});
     defer testing.allocator.free(depfile);
     try tmp.dir.writeFile(io, .{ .sub_path = "object.d", .data = depfile });
     var original_digest: BinDigest = undefined;
