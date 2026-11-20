@@ -111,6 +111,82 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     try testCollectorFailure(arena, init.io, zig, zig_lib, scratch, global_cache);
+    try testSharedCache(init, zig, zig_lib, scratch, global_cache);
+}
+
+fn testSharedCache(
+    init: std.process.Init,
+    zig: []const u8,
+    zig_lib: []const u8,
+    scratch: []const u8,
+    global_cache: []const u8,
+) !void {
+    const arena = init.arena.allocator();
+    const io = init.io;
+    const cache = try std.fs.path.join(arena, &.{ scratch, "shared-cache" });
+    var argv: [2][]const []const u8 = undefined;
+    var outputs: [2][]const u8 = undefined;
+
+    for (&argv, &outputs, 1..) |*command, *output, root_number| {
+        const root_name = try arena.print("root-{d}", .{root_number});
+        const root = try std.fs.path.join(arena, &.{ scratch, root_name });
+        const dir = try Io.Dir.cwd().createDirPathOpen(io, root, .{});
+        defer dir.close(io);
+        for ([_][]const u8{ "a", "b" }) |stem| {
+            var source: Io.Writer.Allocating = .init(arena);
+            // Keep both initial compiles busy long enough to overlap.
+            for (0..2000) |i| {
+                try source.writer.print("int {s}{d}(int x) {{ return x + {d}; }}\n", .{ stem, i, i + root_number });
+            }
+            if (std.mem.eql(u8, stem, "a")) {
+                try source.writer.writeAll("int b0(int); int main(void) { return a0(0) + 2*b0(0); }\n");
+            }
+            try write(dir, io, try arena.print("{s}.c", .{stem}), source.written());
+        }
+
+        const a = try std.fs.path.join(arena, &.{ root, "a.c" });
+        const b = try std.fs.path.join(arena, &.{ root, "b.c" });
+        const name = if (builtin.os.tag == .windows) "program.exe" else "program";
+        output.* = try std.fs.path.join(arena, &.{ root, name });
+        const output_arg = try arena.print("-femit-bin={s}", .{output.*});
+
+        var args: std.ArrayList([]const u8) = .empty;
+        try args.appendSlice(arena, &.{
+            zig,               "build-exe", "-j1",         "-OReleaseFast", "-lc",
+            "-fno-sanitize-c", "--name",    "program",     "--zig-lib-dir", zig_lib,
+            "--build-root",    root,        "--cache-dir", cache,           "--global-cache-dir",
+            global_cache,      output_arg,
+        });
+        if (builtin.os.tag.isDarwin()) try args.append(arena, "-fno-new-linker");
+        try args.appendSlice(arena, if (root_number == 1) &.{ a, b } else &.{ b, a });
+        command.* = args.items;
+    }
+
+    var first = try io.concurrent(runSharedCacheBuild, .{ init.gpa, io, argv[0] });
+    defer first.cancel(io) catch {};
+    try runSharedCacheBuild(init.gpa, io, argv[1]);
+    try first.await(io);
+
+    for (outputs, 1..) |output, root_number| {
+        const result = try std.process.run(arena, io, .{ .argv = &.{output} });
+        if (result.term != .exited or result.term.exited != 3 * root_number) {
+            std.log.err("unexpected result for {s}: {any}\n{s}", .{ output, result.term, result.stderr });
+            return error.WrongSharedCacheOutput;
+        }
+    }
+}
+
+fn runSharedCacheBuild(gpa: std.mem.Allocator, io: Io, argv: []const []const u8) !void {
+    const result = try std.process.run(gpa, io, .{
+        .argv = argv,
+        .timeout = .{ .deadline = .fromNow(io, .{ .clock = .awake, .raw = .fromSeconds(30) }) },
+    });
+    defer gpa.free(result.stdout);
+    defer gpa.free(result.stderr);
+    if (result.term != .exited or result.term.exited != 0) {
+        std.log.err("shared cache build failed: {any}\n{s}", .{ result.term, result.stderr });
+        return error.SharedCacheBuildFailed;
+    }
 }
 
 fn testCollectorFailure(arena: std.mem.Allocator, io: Io, zig: []const u8, zig_lib: []const u8, scratch: []const u8, global_cache: []const u8) !void {

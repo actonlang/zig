@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const test_step = b.step("test", "Test C include-search dependencies");
+    const test_step = b.step("test", "Test C object caching");
     b.default_step = test_step;
     if (!std.process.can_spawn) return;
 

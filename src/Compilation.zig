@@ -831,10 +831,6 @@ pub const CObject = struct {
         success: struct {
             /// The outputted result. `sub_path` owned by gpa.
             object_path: Cache.Path,
-            /// This is a file system lock on the cache hash manifest representing this
-            /// object. It prevents other invocations of the Zig compiler from interfering
-            /// with this object until released.
-            lock: Cache.Lock,
         },
         /// There will be a corresponding ErrorMsg in Compilation.failed_c_objects.
         failure,
@@ -1115,7 +1111,7 @@ pub const CObject = struct {
     };
 
     /// Returns if there was failure.
-    pub fn clearStatus(self: *CObject, gpa: Allocator, io: Io) bool {
+    pub fn clearStatus(self: *CObject, gpa: Allocator) bool {
         switch (self.status) {
             .new => return false,
             .failure, .failure_retryable => {
@@ -1124,15 +1120,14 @@ pub const CObject = struct {
             },
             .success => |*success| {
                 gpa.free(success.object_path.sub_path);
-                success.lock.release(io);
                 self.status = .new;
                 return false;
             },
         }
     }
 
-    pub fn destroy(self: *CObject, gpa: Allocator, io: Io) void {
-        _ = self.clearStatus(gpa, io);
+    pub fn destroy(self: *CObject, gpa: Allocator) void {
+        _ = self.clearStatus(gpa);
         gpa.destroy(self);
     }
 };
@@ -2588,7 +2583,7 @@ pub fn destroy(comp: *Compilation) void {
     }
 
     for (comp.c_objects.items) |c_object| {
-        c_object.destroy(gpa, io);
+        c_object.destroy(gpa);
     }
     comp.c_objects.deinit(gpa);
 
@@ -2943,11 +2938,8 @@ pub fn update(comp: *Compilation, main_progress_node: std.Progress.Node) UpdateE
         // updates if we've done prelink already. https://codeberg.org/ziglang/zig/issues/32081
     } else {
         try comp.c_object_work_queue.ensureUnusedCapacity(gpa, comp.c_objects.items.len);
-        // Release every prior manifest lock before a worker can run. With
-        // duplicate C inputs, a worker may need an exclusive lock still held
-        // by another input; the async scheduler can execute workers inline.
         for (comp.c_objects.items) |c_object| {
-            if (c_object.clearStatus(gpa, io)) {
+            if (c_object.clearStatus(gpa)) {
                 // OOM failures do not have a diagnostic entry.
                 comp.mutex.lockUncancelable(io);
                 defer comp.mutex.unlock(io);
@@ -5564,6 +5556,26 @@ fn recordCObjectInputs(comp: *Compilation, man: *const Cache.Manifest) (Allocato
     }
 }
 
+fn hashUncachedCObject(io: Io, dir: Io.Dir, basename: []const u8) !Cache.HexDigest {
+    const file = try dir.openFile(io, basename, .{});
+    defer file.close(io);
+
+    var buffer: [4096]u8 = undefined;
+    var reader = file.reader(io, &.{});
+    var hash: Cache.HashHelper = .{};
+    hash.addBytes("uncached C object");
+    var hashing: Io.Writer.Hashing(Cache.Hasher) = .initHasher(hash.hasher, &buffer);
+    _ = reader.interface.streamRemaining(&hashing.writer) catch |err| switch (err) {
+        error.ReadFailed => return reader.err.?,
+        error.WriteFailed => unreachable,
+    };
+    hashing.writer.flush() catch unreachable;
+
+    var digest: Cache.BinDigest = undefined;
+    hashing.hasher.final(&digest);
+    return Cache.binToHex(digest);
+}
+
 fn updateCObject(
     comp: *Compilation,
     c_object: *CObject,
@@ -5614,6 +5626,7 @@ fn updateCObject(
         comp.root_name
     else
         c_source_basename[0 .. c_source_basename.len - fs.path.extension(c_source_basename).len];
+    man.hash.addBytes(o_basename_noext);
 
     const target = comp.getTarget();
     assert(target.ofmt != .c);
@@ -5724,6 +5737,11 @@ fn updateCObject(
             ),
         };
         defer zig_cache_tmp_dir.close(io);
+        const tmp_basename = fs.path.basename(out_obj_path);
+        defer zig_cache_tmp_dir.deleteFile(io, tmp_basename) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => log.warn("failed to delete {q}: {t}", .{ out_obj_path, err }),
+        };
 
         const out_diag_path = if (comp.clang_passthrough_mode or !ext.clangSupportsDiagnostics())
             null
@@ -5929,23 +5947,22 @@ fn updateCObject(
             try comp.recordCObjectInputs(&man);
         }
 
-        // We don't actually care whether it's a cache hit or miss; we just need the digest and the lock.
-        const digest = inner: {
-            if (comp.disable_c_depfile) {
-                var diagnostic: Cache.Manifest.CheckDiagnostic = undefined;
-                const status = man.check(&diagnostic, child_progress_node) catch |err| switch (err) {
-                    error.OutOfMemory, error.Canceled => |e| return e,
-                    error.CacheCheckFailed => {
-                        return comp.failCObj(c_object, "checking cache failed: {f}", .{diagnostic.fmt(&man)});
-                    },
-                };
-                log.debug("ignored C object cache {f}", .{status.fmt(&man)});
-                if (status == .hit) break :inner man.hitDigestHex();
+        const digest = if (comp.disable_c_depfile)
+            // Without dependency tracking, the inputs cannot identify the result.
+            // Use the bytes just compiled so a different result gets its own path.
+            hashUncachedCObject(io, zig_cache_tmp_dir, tmp_basename) catch |err| switch (err) {
+                error.Canceled => |e| return e,
+                else => |e| return comp.failCObjRetryable(
+                    c_object,
+                    "failed to hash {q}: {t}",
+                    .{ out_obj_path, e },
+                ),
             }
-            break :inner man.missDigestHex();
-        };
+        else
+            man.missDigestHex();
 
-        // Rename into place.
+        // Publish the complete object before the manifest. Once published, the
+        // object can be read without holding a manifest lock across other C jobs.
         const o_sub_path = try fs.path.join(arena, &.{ "o", &digest });
         var o_dir = comp.dirs.local_cache.handle.createDirPathOpen(io, o_sub_path, .{}) catch |err| switch (err) {
             error.Canceled => |e| return e,
@@ -5956,8 +5973,8 @@ fn updateCObject(
             ),
         };
         defer o_dir.close(io);
-        const tmp_basename = fs.path.basename(out_obj_path);
-        Io.Dir.rename(zig_cache_tmp_dir, tmp_basename, o_dir, o_basename, io) catch |err| switch (err) {
+        Io.Dir.renamePreserve(zig_cache_tmp_dir, tmp_basename, o_dir, o_basename, io) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
             error.Canceled => |e| return e,
             else => |e| return comp.failCObjRetryable(
                 c_object,
@@ -5974,17 +5991,11 @@ fn updateCObject(
                 },
             ),
         };
+        if (!comp.disable_c_depfile) man.finalize() catch |err|
+            log.warn("failed to write cache manifest when compiling {q}: {t}", .{ c_object.src.src_path, err });
+
         break :d digest;
     };
-
-    if (man.have_exclusive_lock) {
-        // Write the updated manifest. This is a no-op if the manifest is not dirty. Note that it is
-        // possible we had a hit and the manifest is dirty, for example if the file mtime changed but
-        // the contents were the same, we hit the cache but the manifest is dirty and we need to update
-        // it to prevent doing a full file content comparison the next time around.
-        man.finalize() catch |err|
-            log.warn("failed to write cache manifest when compiling {q}: {t}", .{ c_object.src.src_path, err });
-    }
 
     const o_basename = try arena.print("{s}{s}", .{ o_basename_noext, o_ext });
 
@@ -5994,7 +6005,6 @@ fn updateCObject(
                 .root_dir = comp.dirs.local_cache,
                 .sub_path = try fs.path.join(gpa, &.{ "o", &digest, o_basename }),
             },
-            .lock = man.toOwnedLock(),
         },
     };
 
