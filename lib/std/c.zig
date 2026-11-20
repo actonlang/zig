@@ -11134,7 +11134,7 @@ pub extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: 
 pub extern "c" fn sysctlnametomib(name: [*:0]const u8, mibp: ?*c_int, sizep: ?*usize) c_int;
 pub extern "c" fn tcgetattr(fd: fd_t, termios_p: *termios) c_int;
 pub extern "c" fn tcsetattr(fd: fd_t, optional_action: TCSA, termios_p: *const termios) c_int;
-pub const fcntl = if (lfs64 and native_abi.isGnu()) private.fcntl64 else private.fcntl;
+pub const fcntl = if (builtin.target.isGnuLibC() and versionCheck(.{ .major = 2, .minor = 28, .patch = 0 })) private.fcntl64 else private.fcntl;
 pub extern "c" fn uname(buf: *utsname) c_int;
 
 pub extern "c" fn gethostname(name: [*]u8, len: usize) c_int;

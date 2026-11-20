@@ -104,6 +104,7 @@ pub fn build(b: *std.Build) void {
     versions: for ([_][]const u8{
         "native-linux-gnu.2.17", // Currently oldest supported, see #17769
         "native-linux-gnu.2.23",
+        "native-linux-gnu.2.27",
         "native-linux-gnu.2.28",
         "native-linux-gnu.2.33",
         "native-linux-gnu.2.38",

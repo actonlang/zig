@@ -45,6 +45,13 @@ fn checkStat() void {
     assert(std.posix.errno(result) == .NOENT);
 }
 
+// fcntl64 is unavailable before glibc 2.28; older targets must use fcntl.
+fn checkFcntl() void {
+    const result = std.c.fcntl(-1, std.c.F.GETFD, @as(c_int, 0));
+    assert(result == -1);
+    assert(std.posix.errno(result) == .BADF);
+}
+
 // PR #17607 - reallocarray not visible in headers
 fn checkReallocarray() void {
     // reallocarray was introduced in v2.26
@@ -114,6 +121,7 @@ fn checkAtExit() void {
 
 pub fn main() !u8 {
     checkStat();
+    checkFcntl();
     checkReallocarray();
     checkStrlcpy();
 
