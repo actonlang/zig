@@ -1,0 +1,96 @@
+name: Release Zig
+
+on:
+  push:
+    tags: ['acton-*']
+
+permissions:
+  contents: read
+
+env:
+  BOOTSTRAP: 0.18.0-dev.1240+74f654a72
+  BOOTSTRAP_SHA256: 14c8b8f8c73dce1c4fdbde05459ee940fb56c056c648f2898a36d0f935cad3ef
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux-musl, aarch64-linux-musl, x86_64-macos-none, aarch64-macos-none]
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build with upstream zig-bootstrap
+        env:
+          CMAKE_GENERATOR: Ninja
+          CMAKE_BUILD_PARALLEL_LEVEL: 4
+        run: |
+          version=${GITHUB_REF_NAME#acton-}
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+\+acton\.[0-9]+$ ]]
+          cd "$RUNNER_TEMP"
+          archive="zig-bootstrap-$BOOTSTRAP.tar.xz"
+          curl --fail --location --retry 3 -o "$archive" "https://ziglang.org/builds/$archive"
+          echo "$BOOTSTRAP_SHA256  $archive" | sha256sum -c -
+          tar xf "$archive"
+          cd "zig-bootstrap-$BOOTSTRAP"
+          # Use the tagged fork source in the upstream release recipe.
+          rm -rf zig
+          mkdir zig
+          git -C "$GITHUB_WORKSPACE" archive HEAD | tar -x -C zig
+          sed -i "s/^ZIG_VERSION=.*/ZIG_VERSION=\"$version\"/" build
+          sed -i "s/const char \*zig_version = \"[^\"]*\";/const char *zig_version = \"$version\";/" zig/bootstrap.c
+          ./build "$TARGET" baseline
+          package="zig-${TARGET%-*}-$version"
+          mv "out/zig-$TARGET-baseline" "$package"
+          tar --sort=name -cJf "$GITHUB_WORKSPACE/$package.tar.xz" "$package"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: '*.tar.xz'
+          compression-level: 0
+          if-no-files-found: error
+
+  check:
+    needs: build
+    strategy:
+      matrix:
+        include:
+          - {target: x86_64-linux-musl, runner: ubuntu-24.04}
+          - {target: aarch64-linux-musl, runner: ubuntu-24.04-arm}
+          - {target: x86_64-macos-none, runner: macos-15-intel}
+          - {target: aarch64-macos-none, runner: macos-15}
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+      - name: Run the packaged compiler on its target
+        run: |
+          archive=(zig-*.tar.xz)
+          tar xf "${archive[0]}"
+          zig="$PWD/${archive[0]%.tar.xz}/zig"
+          test "$("$zig" version)" = "${GITHUB_REF_NAME#acton-}"
+          echo 'const std = @import("std"); test { try std.testing.expectEqual(42, @as(u32, 40) + 2); }' > smoke.zig
+          "$zig" test smoke.zig -lc -fllvm
+          echo 'int main(void) { return 0; }' > smoke.c
+          "$zig" cc smoke.c -o smoke
+          ./smoke
+
+  publish:
+    needs: check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish the four checked archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum zig-*.tar.xz > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Zig ${GITHUB_REF_NAME#acton-}" --notes "Built from $GITHUB_SHA." zig-*.tar.xz SHA256SUMS
