@@ -1,18 +1,49 @@
 name: Build Zig release dependencies
 
 on:
-  push:
-    tags: ['bootstrap-*']
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    outputs:
+      manifest_sha256:
+        description: SHA-256 of the published dependency manifest
+        value: ${{ jobs.ready.outputs.sha256 }}
+
+concurrency:
+  group: ${{ inputs.tag }}
+  queue: max
 
 permissions:
   contents: read
 
 env:
+  INPUT_TAG: ${{ inputs.tag }}
   BOOTSTRAP: 0.18.0-dev.1240+74f654a72
   BOOTSTRAP_SHA256: 14c8b8f8c73dce1c4fdbde05459ee940fb56c056c648f2898a36d0f935cad3ef
 
 jobs:
+  lookup:
+    runs-on: ubuntu-24.04
+    outputs:
+      missing: ${{ steps.release.outputs.missing }}
+    steps:
+      - id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          status=$(curl --silent --show-error --retry 3 --output release.json --write-out '%{http_code}' \
+            -H "Authorization: Bearer $GH_TOKEN" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$INPUT_TAG")
+          case "$status" in
+            200) jq -e '.draft == false' release.json >/dev/null ;;
+            404) echo 'missing=true' >> "$GITHUB_OUTPUT" ;;
+            *) echo "Dependency lookup failed (HTTP $status)" >&2; exit 1 ;;
+          esac
+
   build:
+    needs: lookup
+    if: needs.lookup.outputs.missing == 'true'
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -47,7 +78,7 @@ jobs:
           fi
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: bootstrap-${{ matrix.target }}
           path: '*.tar.zst'
           compression-level: 0
           if-no-files-found: error
@@ -60,13 +91,30 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: bootstrap-*
           merge-multiple: true
       - name: Publish the inputs for tagged Zig builds
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           sha256sum host-zig.tar.zst {aarch64,x86_64}-{linux-musl,macos-none}.tar.zst > SHA256SUMS
-          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+          gh release create "$INPUT_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
             --prerelease --latest=false --title "Zig build inputs ($BOOTSTRAP)" \
             --notes "Built from upstream zig-bootstrap $BOOTSTRAP (SHA-256: $BOOTSTRAP_SHA256)." \
             *.tar.zst SHA256SUMS
+
+  ready:
+    needs: [lookup, publish]
+    if: ${{ !cancelled() && !failure() }}
+    runs-on: ubuntu-24.04
+    outputs:
+      sha256: ${{ steps.manifest.outputs.sha256 }}
+    steps:
+      - id: manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          digest=$(gh release view "$INPUT_TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+            --jq '.assets[] | select(.name == "SHA256SUMS") | .digest')
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || { echo "Missing SHA256SUMS digest for $INPUT_TAG" >&2; exit 1; }
+          echo "sha256=${digest#sha256:}" >> "$GITHUB_OUTPUT"

@@ -15,11 +15,30 @@ permissions:
 
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
-  BOOTSTRAP: 0.18.0-dev.1240+74f654a72
-  BOOTSTRAP_SHA256: 14c8b8f8c73dce1c4fdbde05459ee940fb56c056c648f2898a36d0f935cad3ef
 
 jobs:
+  recipe:
+    runs-on: ubuntu-24.04
+    outputs:
+      tag: ${{ steps.key.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: key
+        run: |
+          [[ "$RELEASE_TAG" =~ ^acton-[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+\+acton\.[0-9]+$ ]] || exit 1
+          read -r digest _ < <(sha256sum .github/workflows/bootstrap.yml)
+          echo "tag=bootstrap-$digest" >> "$GITHUB_OUTPUT"
+
+  dependencies:
+    needs: recipe
+    uses: ./.github/workflows/bootstrap.yml
+    permissions:
+      contents: write
+    with:
+      tag: ${{ needs.recipe.outputs.tag }}
+
   build:
+    needs: [recipe, dependencies]
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -27,34 +46,38 @@ jobs:
         target: [x86_64-linux-musl, aarch64-linux-musl, x86_64-macos-none, aarch64-macos-none]
     env:
       TARGET: ${{ matrix.target }}
+      BOOTSTRAP_TAG: ${{ needs.recipe.outputs.tag }}
+      MANIFEST_SHA256: ${{ needs.dependencies.outputs.manifest_sha256 }}
     steps:
       - uses: actions/checkout@v4
-      - name: Build with upstream zig-bootstrap
+      - name: Build the tagged Zig source
         env:
-          CMAKE_GENERATOR: Ninja
-          CMAKE_BUILD_PARALLEL_LEVEL: 4
+          GH_TOKEN: ${{ github.token }}
         run: |
           version=${RELEASE_TAG#acton-}
-          [[ "$RELEASE_TAG" =~ ^acton-[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+\+acton\.[0-9]+$ ]] || exit 1
+
           cd "$RUNNER_TEMP"
-          archive="zig-bootstrap-$BOOTSTRAP.tar.xz"
-          curl --fail --location --retry 3 -o "$archive" "https://ziglang.org/builds/$archive"
-          echo "$BOOTSTRAP_SHA256  $archive" | sha256sum -c -
-          tar xf "$archive"
-          cd "zig-bootstrap-$BOOTSTRAP"
-          # Use the tagged fork source in the upstream release recipe.
-          rm -rf zig
-          mkdir zig
-          git -C "$GITHUB_WORKSPACE" archive HEAD | tar -x -C zig
-          sed -i "s/^ZIG_VERSION=.*/ZIG_VERSION=\"$version\"/" build
-          sed -i "s/const char \*zig_version = \"[^\"]*\";/const char *zig_version = \"$version\";/" zig/bootstrap.c
-          ./build "$TARGET" baseline
+          gh release download "$BOOTSTRAP_TAG" --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS --pattern host-zig.tar.zst --pattern "$TARGET.tar.zst"
+          echo "$MANIFEST_SHA256  SHA256SUMS" | sha256sum -c -
+          for archive in host-zig.tar.zst "$TARGET.tar.zst"; do
+            awk -v file="$archive" '$2 == file' SHA256SUMS | sha256sum -c -
+          done
+          mkdir host target
+          tar xf host-zig.tar.zst -C host
+          tar xf "$TARGET.tar.zst" -C target
+
+          # The final stage of upstream zig-bootstrap, using the prepared target libraries.
+          cd "$GITHUB_WORKSPACE"
           package="zig-${TARGET%-*}-$version"
-          mv "out/zig-$TARGET-baseline" "$package"
-          tar --sort=name -cJf "$GITHUB_WORKSPACE/$package.tar.xz" "$package"
+          "$RUNNER_TEMP/host/zig" build --zig-lib="$GITHUB_WORKSPACE/lib" --prefix "$RUNNER_TEMP/$package" \
+            --search-prefix "$RUNNER_TEMP/target" -Dflat -Dstatic-llvm \
+            -Doptimize=ReleaseFast -Dstrip -Dtarget="$TARGET" -Dcpu=baseline \
+            -Dversion-string="$version"
+          tar --sort=name -cJf "$package.tar.xz" -C "$RUNNER_TEMP" "$package"
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: zig-${{ matrix.target }}
           path: '*.tar.xz'
           compression-level: 0
           if-no-files-found: error
@@ -72,7 +95,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: ${{ matrix.target }}
+          name: zig-${{ matrix.target }}
       - name: Run the packaged compiler on its target
         run: |
           archive=(zig-*.tar.xz)
@@ -94,6 +117,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
+          pattern: zig-*
           merge-multiple: true
       - name: Publish the four checked archives
         env:
