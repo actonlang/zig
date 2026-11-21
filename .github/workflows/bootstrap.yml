@@ -1,0 +1,72 @@
+name: Build Zig release dependencies
+
+on:
+  push:
+    tags: ['bootstrap-*']
+
+permissions:
+  contents: read
+
+env:
+  BOOTSTRAP: 0.18.0-dev.1240+74f654a72
+  BOOTSTRAP_SHA256: 14c8b8f8c73dce1c4fdbde05459ee940fb56c056c648f2898a36d0f935cad3ef
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-linux-musl, aarch64-linux-musl, x86_64-macos-none, aarch64-macos-none]
+    env:
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Build dependencies with upstream zig-bootstrap
+        env:
+          CMAKE_GENERATOR: Ninja
+          CMAKE_BUILD_PARALLEL_LEVEL: 4
+        run: |
+          cd "$RUNNER_TEMP"
+          archive="zig-bootstrap-$BOOTSTRAP.tar.xz"
+          curl --fail --location --retry 3 -o "$archive" "https://ziglang.org/builds/$archive"
+          echo "$BOOTSTRAP_SHA256  $archive" | sha256sum -c -
+          tar xf "$archive"
+          cd "zig-bootstrap-$BOOTSTRAP"
+          ./build "$TARGET" baseline
+
+          prefix="out/$TARGET-baseline"
+          mkdir -p "$prefix/licenses"
+          cp --parents llvm/LICENSE.TXT clang/LICENSE.TXT lld/LICENSE.TXT zlib/LICENSE zstd/LICENSE "$prefix/licenses"
+          tar --zstd -cf "$GITHUB_WORKSPACE/$TARGET.tar.zst" -C "$prefix" .
+
+          # All four release jobs run on x86_64 Linux and use this same compiler.
+          if [[ "$TARGET" == x86_64-linux-musl ]]; then
+            host="out/zig-$TARGET-baseline"
+            test "$("$host/zig" version)" = "$BOOTSTRAP"
+            tar --zstd -cf "$GITHUB_WORKSPACE/host-zig.tar.zst" -C "$host" .
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: '*.tar.zst'
+          compression-level: 0
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish the inputs for tagged Zig builds
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha256sum host-zig.tar.zst {aarch64,x86_64}-{linux-musl,macos-none}.tar.zst > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --prerelease --latest=false --title "Zig build inputs ($BOOTSTRAP)" \
+            --notes "Built from upstream zig-bootstrap $BOOTSTRAP (SHA-256: $BOOTSTRAP_SHA256)." \
+            *.tar.zst SHA256SUMS
