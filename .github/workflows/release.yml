@@ -3,11 +3,18 @@ name: Release Zig
 on:
   push:
     tags: ['acton-*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Version tag to stamp on a test build of the selected ref
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
   BOOTSTRAP: 0.18.0-dev.1240+74f654a72
   BOOTSTRAP_SHA256: 14c8b8f8c73dce1c4fdbde05459ee940fb56c056c648f2898a36d0f935cad3ef
 
@@ -27,8 +34,8 @@ jobs:
           CMAKE_GENERATOR: Ninja
           CMAKE_BUILD_PARALLEL_LEVEL: 4
         run: |
-          version=${GITHUB_REF_NAME#acton-}
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+\+acton\.[0-9]+$ ]]
+          version=${RELEASE_TAG#acton-}
+          [[ "$RELEASE_TAG" =~ ^acton-[0-9]+\.[0-9]+\.[0-9]+-dev\.[0-9]+\+acton\.[0-9]+$ ]] || exit 1
           cd "$RUNNER_TEMP"
           archive="zig-bootstrap-$BOOTSTRAP.tar.xz"
           curl --fail --location --retry 3 -o "$archive" "https://ziglang.org/builds/$archive"
@@ -71,7 +78,7 @@ jobs:
           archive=(zig-*.tar.xz)
           tar xf "${archive[0]}"
           zig="$PWD/${archive[0]%.tar.xz}/zig"
-          test "$("$zig" version)" = "${GITHUB_REF_NAME#acton-}"
+          test "$("$zig" version)" = "${RELEASE_TAG#acton-}"
           echo 'const std = @import("std"); test { try std.testing.expectEqual(42, @as(u32, 40) + 2); }' > smoke.zig
           "$zig" test smoke.zig -lc -fllvm
           echo 'int main(void) { return 0; }' > smoke.c
@@ -79,6 +86,7 @@ jobs:
           ./smoke
 
   publish:
+    if: github.event_name == 'push'
     needs: check
     runs-on: ubuntu-24.04
     permissions:
